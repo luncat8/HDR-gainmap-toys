@@ -1,0 +1,390 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>img → gain → HDR</title>
+
+<style>
+	:root {
+		color-scheme: dark;
+		font: 14px system-ui, sans-serif;
+	}
+
+	body {
+		margin: 0;
+		padding: 20px;
+		background: #202124;
+	}
+
+	#drop {
+		width: min(900px, 100%);
+		height: 100px;
+		display: grid;
+		place-items: center;
+		border: 2px dashed #777;
+		border-radius: 12px;
+		box-sizing: border-box;
+		cursor: pointer;
+		color: #ccc;
+		margin-bottom: 16px;
+	}
+
+	#drop.dragover {
+		border-color: #4da3ff;
+		background: #16304a;
+	}
+
+	#controls {
+		width: min(900px, 100%);
+		display: grid;
+		grid-template-columns: 180px 1fr 70px;
+		gap: 10px;
+		align-items: center;
+		margin-bottom: 16px;
+	}
+
+	input[type="range"] {
+		width: 100%;
+	}
+
+	canvas {
+		display: block;
+		max-width: min(900px, 100%);
+		max-height: 75vh;
+		width: auto;
+		height: auto;
+		background: white;
+		object-fit: contain;
+	}
+
+	#file {
+		display: none;
+	}
+
+	#status {
+		color: #aaa;
+		margin-top: 10px;
+	}
+</style>
+
+<div id="drop">
+	drop image or click to open
+</div>
+
+<input id="file" type="file" accept="image/png,image/jpeg,image/webp">
+
+<div id="controls">
+	<label for="exposure">Exposure</label>
+	<input id="exposure" type="range" min="-2" max="4" step="0.01" value="0">
+	<output id="exposureValue">0.00</output>
+
+	<label for="highlightGain">Highlights gain</label>
+	<input id="highlightGain" type="range" min="1" max="8" step="0.01" value="4">
+	<output id="highlightGainValue">4.00</output>
+
+	<label for="threshold">Highlight threshold</label>
+	<input id="threshold" type="range" min="0" max="1" step="0.001" value="0.55">
+	<output id="thresholdValue">0.550</output>
+</div>
+
+<canvas id="canvas" width="900" height="600"></canvas>
+<div id="status"></div>
+
+<script type="module">
+const canvas = document.querySelector("#canvas");
+const context = canvas.getContext("webgpu");
+
+if (!navigator.gpu || !context) {
+	throw new Error("WebGPU не поддерживается");
+}
+
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) {
+	throw new Error("GPU adapter недоступен");
+}
+
+const device = await adapter.requestDevice();
+
+context.configure({
+	device,
+	format: "rgba16float",
+	colorSpace: "srgb",
+	toneMapping: {
+		mode: "extended",
+	},
+	alphaMode: "opaque",
+});
+
+const shader = device.createShaderModule({
+	code: `
+		struct Params {
+			// x = exposure
+			// y = highlight gain
+			// z = highlight threshold
+			// w = unused
+			values : vec4f,
+		};
+
+		@group(0) @binding(0)
+		var imageTex : texture_2d<f32>;
+
+		@group(0) @binding(1)
+		var imageSampler : sampler;
+
+		@group(0) @binding(2)
+		var<uniform> params : Params;
+
+		struct VertexOutput {
+			@builtin(position) position : vec4f,
+		};
+
+		@vertex
+		fn vs(@builtin(vertex_index) index : u32) -> VertexOutput {
+			var positions = array<vec2f, 3>(
+				vec2f(-1.0, -1.0),
+				vec2f( 3.0, -1.0),
+				vec2f(-1.0,  3.0)
+			);
+
+			var output : VertexOutput;
+			output.position = vec4f(positions[index], 0.0, 1.0);
+			return output;
+		}
+
+		@fragment
+		fn fs(
+			@builtin(position) position : vec4f
+		) -> @location(0) vec4f {
+			let canvasSize = vec2f(
+				f32(textureDimensions(imageTex).x),
+				f32(textureDimensions(imageTex).y)
+			);
+
+			let uv = position.xy / canvasSize;
+
+			// Текстура rgba8unorm-srgb автоматически декодируется
+			// из sRGB в линейное пространство при выборке.
+			let source = textureSample(imageTex, imageSampler, uv);
+			let rgb = source.rgb;
+
+			let exposure = params.values.x;
+			let highlightGain = params.values.y;
+			let threshold = params.values.z;
+
+			// Общая экспозиция:
+			let exposed = rgb * exp2(exposure);
+
+			// Оценка яркости пикселя.
+			let luminance = dot(
+				exposed,
+				vec3f(0.2126, 0.7152, 0.0722)
+			);
+
+			// Плавно усиливаем только светлые области.
+			let mask = smoothstep(threshold, 1.0, luminance);
+			let gain = mix(1.0, highlightGain, mask);
+
+			let hdr = exposed * gain;
+
+			// Значения hdr выше 1.0 сохраняются в rgba16float.
+			return vec4f(hdr, 1.0);
+		}
+	`,
+});
+
+const pipeline = device.createRenderPipeline({
+	layout: "auto",
+
+	vertex: {
+		module: shader,
+		entryPoint: "vs",
+	},
+
+	fragment: {
+		module: shader,
+		entryPoint: "fs",
+		targets: [
+			{
+				format: "rgba16float",
+			},
+		],
+	},
+
+	primitive: {
+		topology: "triangle-list",
+	},
+});
+
+// Uniform buffer: vec4f = 16 байт.
+const uniformBuffer = device.createBuffer({
+	size: 16,
+	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+
+const sampler = device.createSampler({
+	magFilter: "linear",
+	minFilter: "linear",
+	mipmapFilter: "linear",
+});
+
+let imageTexture = null;
+let bindGroup = null;
+
+const exposure = document.querySelector("#exposure");
+const highlightGain = document.querySelector("#highlightGain");
+const threshold = document.querySelector("#threshold");
+
+const exposureValue = document.querySelector("#exposureValue");
+const highlightGainValue = document.querySelector("#highlightGainValue");
+const thresholdValue = document.querySelector("#thresholdValue");
+
+function updateLabels() {
+	exposureValue.value = Number(exposure.value).toFixed(2);
+	highlightGainValue.value = Number(highlightGain.value).toFixed(2);
+	thresholdValue.value = Number(threshold.value).toFixed(3);
+}
+
+function updateUniforms() {
+	const values = new Float32Array([
+		Number(exposure.value),
+		Number(highlightGain.value),
+		Number(threshold.value),
+		0,
+	]);
+
+	device.queue.writeBuffer(uniformBuffer, 0, values);
+	updateLabels();
+	render();
+}
+
+for (const input of [exposure, highlightGain, threshold]) {
+	input.addEventListener("input", updateUniforms);
+}
+
+function render() {
+	if (!bindGroup) {
+		return;
+	}
+
+	const view = context.getCurrentTexture().createView();
+
+	const encoder = device.createCommandEncoder();
+
+	const pass = encoder.beginRenderPass({
+		colorAttachments: [
+			{
+				view,
+				clearValue: { r: 0, g: 0, b: 0, a: 1 },
+				loadOp: "clear",
+				storeOp: "store",
+			},
+		],
+	});
+
+	pass.setPipeline(pipeline);
+	pass.setBindGroup(0, bindGroup);
+	pass.draw(3);
+	pass.end();
+
+	device.queue.submit([encoder.finish()]);
+}
+
+async function loadImage(file) {
+	if (!file.type.startsWith("image/")) {
+		throw new Error("Это не изображение");
+	}
+
+	const bitmap = await createImageBitmap(file, {
+		colorSpaceConversion: "default",
+		premultiplyAlpha: "premultiply",
+	});
+
+	// Сохраняем соотношение сторон изображения.
+	canvas.width = bitmap.width;
+	canvas.height = bitmap.height;
+
+	if (imageTexture) {
+		imageTexture.destroy();
+	}
+
+	imageTexture = device.createTexture({
+		size: [bitmap.width, bitmap.height],
+		format: "rgba8unorm-srgb",
+		usage:
+			GPUTextureUsage.TEXTURE_BINDING |
+			GPUTextureUsage.COPY_DST |
+			GPUTextureUsage.RENDER_ATTACHMENT,
+	});
+
+	device.queue.copyExternalImageToTexture(
+		{ source: bitmap },
+		{ texture: imageTexture },
+		[bitmap.width, bitmap.height]
+	);
+
+	bindGroup = device.createBindGroup({
+		layout: pipeline.getBindGroupLayout(0),
+		entries: [
+			{
+				binding: 0,
+				resource: imageTexture.createView(),
+			},
+			{
+				binding: 1,
+				resource: sampler,
+			},
+			{
+				binding: 2,
+				resource: {
+					buffer: uniformBuffer,
+				},
+			},
+		],
+	});
+
+	document.querySelector("#status").textContent =
+		`${file.name} — ${bitmap.width} × ${bitmap.height}`;
+
+	updateUniforms();
+}
+
+const drop = document.querySelector("#drop");
+const fileInput = document.querySelector("#file");
+
+drop.addEventListener("click", () => {
+	fileInput.click();
+});
+
+fileInput.addEventListener("change", () => {
+	const file = fileInput.files[0];
+	if (file) {
+		loadImage(file).catch(error => {
+			console.error(error);
+			document.querySelector("#status").textContent = error.message;
+		});
+	}
+});
+
+drop.addEventListener("dragover", event => {
+	event.preventDefault();
+	drop.classList.add("dragover");
+});
+
+drop.addEventListener("dragleave", () => {
+	drop.classList.remove("dragover");
+});
+
+drop.addEventListener("drop", event => {
+	event.preventDefault();
+	drop.classList.remove("dragover");
+
+	const file = event.dataTransfer.files[0];
+
+	if (file) {
+		loadImage(file).catch(error => {
+			console.error(error);
+			document.querySelector("#status").textContent = error.message;
+		});
+	}
+});
+
+updateUniforms();
+</script>

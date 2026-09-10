@@ -120,10 +120,12 @@ def main() -> int:
     base = np.array(Image.open(args.base).convert("RGB"), dtype=np.uint8)
     gain = np.array(Image.open(args.gainmap).convert("L"), dtype=np.uint8)
     # the gain map is stored at a fraction of the base resolution: upsample it
-    # bilinearly, the way a decoder does
-    gw, gh = int(meta.get("baseWidth", base.shape[1])), int(meta.get("baseHeight", base.shape[0]))
-    if gain.shape[1] != gw or gain.shape[0] != gh:
-        gain = np.array(Image.fromarray(gain).resize((gw, gh), Image.BILINEAR), dtype=np.uint8)
+    # bilinearly, the way a decoder does. the decoder upsamples to the *base
+    # image's actual* resolution, so use that and ignore the stale metadata
+    # baseWidth/baseHeight if they disagree (that mismatch crashed this).
+    bh, bw = base.shape[:2]
+    if gain.shape[1] != bw or gain.shape[0] != bh:
+        gain = np.array(Image.fromarray(gain).resize((bw, bh), Image.BILINEAR), dtype=np.uint8)
 
     hdr = hdr_from_gainmap(base, gain, meta)
     target = args.out or args.base.replace("_base.png", "") + "_gainmap.avif"
