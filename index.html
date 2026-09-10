@@ -4,10 +4,46 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HDR-gainmap toys</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div>
-  <canvas id="c"></canvas>
-</div>
+<header>
+  <h1>HDR gain map toys</h1>
+  <div id="gpu">starting…</div>
+  <div id="status"></div>
+</header>
+
+<main>
+  <section class="stage">
+    <div id="drop">
+      <strong>drop an image</strong>
+      <label class="file">open…<input id="open" type="file" accept="image/*"></label>
+      <div id="patterns">
+        <button type="button" data-kind="ramp">ramp</button>
+        <button type="button" data-kind="sky">sky + sun</button>
+        <button type="button" data-kind="steps">steps</button>
+      </div>
+    </div>
+
+    <div id="viewcol"><canvas id="view"></canvas></div>
+
+    <div class="saved">
+      <h3>saved file (as an &lt;img&gt;)</h3>
+      <img id="saved" alt="saved ultra hdr jpeg">
+    </div>
+  </section>
+
+  <aside id="controls">
+    <canvas id="curve" width="300" height="190"></canvas>
+  </aside>
+</main>
+
+<script src="src/ultrahdr.js"></script>
+<script src="src/gpu.js"></script>
+<script src="src/shaders.js"></script>
+<script src="src/curve.js"></script>
+<script src="src/patterns.js"></script>
+<script src="src/ui.js"></script>
+<script src="src/app.js"></script>
 </body>
 </html>

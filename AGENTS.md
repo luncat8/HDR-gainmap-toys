@@ -33,6 +33,19 @@
 
 ## concepts
 
+	hdr image = linear light, sRGB primaries, 1.0 = SDR white (203 nits by default).
+	everything above 1.0 is headroom the display may or may not have.
+
+	gain map = per pixel log2 boost, stored as 8 bit "recovery" in [0,1] at a
+	fraction of the image resolution. the file keeps the SDR rendition plus the
+	map; a decoder combines them and adapts the boost to the display headroom.
+
+	authoring here does not divide hdr by sdr: the curve *is* the gain, so there
+	is no log(0) case and no offsets to tune. recovery = curve(Ysdr), and the
+	preview applies the same weight a decoder would, so canvas == saved file.
+
+	ultra hdr jpeg = SDR jpeg + gain map jpeg + XMP (hdrgm, GContainer) + MPF
+	(APP2). see findings-pitfalls-skills.md for the byte level details.
 
 ## files
 
