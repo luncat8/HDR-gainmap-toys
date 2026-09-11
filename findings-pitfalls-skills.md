@@ -58,12 +58,63 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
 
 * impossible in the browser: no AV1 encoder and no container writer with an
   `altr` (alternate) item. `canvas.toBlob` has no `image/avif` either.
-* `avifgainmaputil combine base alternate out.avif` **computes the gain map
-  itself** from the two images — it cannot take a precomputed one. feed it a
-  16-bit PNG alternate (PQ / BT.2020 here) and pass `--ignore-profile`:
-  libavif fails with "Not implemented" on images that carry an ICC profile.
-* Pillow cannot save 16-bit RGB PNG; `tools/avif_gainmap.py` has a 25-line
-  zlib writer for that (`IHDR` depth 16, colortype 2, filter 0 rows).
+* **proper mix = convert the Ultra HDR JPEG.** `avifgainmaputil convert
+  in.ultrahdr.jpg out.avif` (or `avifenc --qgain-map Q -q Q in.jpg out.avif`)
+  reads the gain map already inside the JPEG and re-encodes it into an AVIF,
+  so the AVIF keeps exactly the authored gain map. this is the terminal path
+  `tools/avif_gainmap.py` uses; no base/alternate reconstruction needed.
+* `avifgainmaputil <command>` has 7 commands: `help`, `combine`, `convert`,
+  `tonemap`, `swapbase`, `extractgainmap`, `printmetadata` (libavif ≥ 1.3).
+* `combine base_image alternate_image out.avif` **computes the gain map
+  itself** from the two renditions — only use it when you have a true HDR
+  alternate. full help:
+  ```
+  avifgainmaputil combine base_image alternate_image output_image.avif
+    [--downscaling N] [--qgain-map 0-100] [--depth-gain-map {8,10,12}]
+    [--yuv-gain-map {444,422,420,400}] [--cicp-base P/T/M]
+    [--cicp-alternate P/T/M] [-s SPEED] [-q QCOLOR] [--qalpha Q]
+    [-y {444,422,420,400}] [-d {0,8,10,12}] [--ignore-profile]
+  ```
+* combine inputs: 8-bit sRGB base PNG + 12/16-bit PQ/BT.2020 alternate PNG.
+  libavif refuses images with ICC profiles → pass `--ignore-profile`. set the
+  HDR CICP by hand or the result looks flat gray in HDR viewers:
+  `--cicp-alternate 9/16/9`, base `1/13/1` (sRGB transfer is 13, not 1).
+* the old "reconstruct a PQ alternate from the gain map + feed combine" path
+  was dropped: it recomputed a gain map that could disagree with the authored
+  one (and had headroom/resolution mismatch bugs).
+* **libxml2-less builds**: `avifgainmaputil convert` / `avifenc` reading a
+  *JPEG* gain map needs libxml2 at libavif build time; many Windows builds
+  lack it and print "JPEG gainmap conversion unavailable because
+  avifgainmaputil was not built with libxml2". reading/writing *AVIF* gain
+  maps does NOT need libxml2. so the fallback that works everywhere: split
+  the Ultra HDR JPEG in python (XMP + MPF, same parse as `ultrahdr.js`),
+  `avifenc` base + gain map separately (plain JPEG reads need no libxml2),
+  then repack both AV1 items into one AVIF with the container below.
+  implemented in `tools/avif_gainmap.py` (auto-fallback on converter failure).
+* **AVIF gain map container (libavif >= 1.3 / 'tmap' era, ISO 21496-1 +
+  23008-12 amendment)**: items `1 av01 Color`, `2 tmap` (hidden=false),
+  `3 av01 gain map` (infe flags=1 hidden). `tmap` item data = ToneMapImage:
+  u8 version 0 + GainMapMetadata {u16 minimum_version 0, u16 writer_version 0,
+  bits: is_multichannel(1) use_base_colour_space(1) reserved(6), u32x4
+  base/alternate headroom n,d, then per channel (1 or 3): int32 min n, u32 d,
+  int32 max n, u32 d, u32 gamma n,d, int32 base_offset n,d, int32
+  alternate_offset n,d — all big endian}. `iref dimg tmap -> [color, gain]`,
+  `grpl altr [tmap, color]` (group id must not collide with item ids),
+  ftyp must carry the `tmap` brand, ipma: tmap gets base ispe + base pixi +
+  a nclx colr with transfer 16 (PQ) and the base primaries/matrix. hdrgm
+  mapping (mirror of libavif avifjpeg.c): CapacityMin/Max -> base/alternate
+  headroom, OffsetSDR/HDR -> base/alternate offset, use_base_colour_space=1.
+  verified against libavif main goldens + `avifgainmaputil printmetadata`.
+  current libavif reads ONLY this format for AVIF (no legacy fallback).
+* doubles -> n/d fractions: continued fractions as in libavif
+  `avifDoubleToUnsignedFractionImpl` (max numerator UINT32_MAX for headrooms,
+  INT32_MAX for signed fields); ported in `tools/avif_gainmap.py`.
+* sandbox: no avifenc; `pip install pillow pillow-avif-plugin` gives real
+  AV1 encode/decode for tests, but its bundled libavif predates 'tmap' and
+  rejects the merged file — build current libavif from source instead
+  (dav1d with `-Denable_asm=false` needs no nasm; aom from the
+  `arthenica/libaom` GitHub mirror with `-DAOM_TARGET_CPU=generic`,
+  googlesource is blocked).
 
 ## browser jpeg encoding
 

@@ -87,5 +87,19 @@ const half = UHDR.weightFactor(parsed.meta, Math.pow(2, meta.gainMapMax / 2));
 check('half headroom weights the boost', Math.abs(half - 0.5) < 1e-6, half);
 check('no headroom → no boost', UHDR.weightFactor(parsed.meta, 1) === 0);
 
+// ── gain map range vs display capacity are separate ────────────────────────
+// A curve whose top is below the mastered peak: GainMapMax < HDRCapacityMax.
+const partial = UHDR.buildUltraHDR(base, gainmap, {
+	gainMapMin: 0, gainMapMax: 1, hdrCapacityMin: 0, hdrCapacityMax: 2.3,
+	offsetSDR: 0, offsetHDR: 0, gamma: 1
+});
+const partialMeta = UHDR.parseUltraHDR(partial.bytes).meta;
+check('gain map max is the curve top, not the peak', Math.abs(partialMeta.gainMapMax - 1) < 1e-6,
+	partialMeta.gainMapMax);
+check('capacity max is the mastered peak', Math.abs(partialMeta.hdrCapacityMax - 2.3) < 1e-6,
+	partialMeta.hdrCapacityMax);
+check('full headroom still reaches the curve top',
+	UHDR.weightFactor(partialMeta, Math.pow(2, 2.3)) === 1);
+
 console.log(failures ? `\n${failures} FAILURES` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

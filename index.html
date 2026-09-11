@@ -25,16 +25,18 @@
       </div>
     </div>
 
-    <div id="viewcol"><canvas id="view"></canvas></div>
-
-    <div class="saved">
-      <h3>saved file (as an &lt;img&gt;)</h3>
-      <img id="saved" alt="saved ultra hdr jpeg">
+    <div id="viewcol">
+      <div id="viewwrap"><canvas id="view"></canvas></div>
+      <canvas id="histo" height="110"></canvas>
     </div>
   </section>
 
   <aside id="controls">
     <canvas id="curve" width="300" height="190"></canvas>
+    <div class="saved">
+      <h3>saved file (as an &lt;img&gt;)</h3>
+      <img id="saved" alt="saved ultra hdr jpeg">
+    </div>
   </aside>
 </main>
 

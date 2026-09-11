@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Double-clickable helper: produces a gain map AVIF from tools/avif_gainmap.py.
+"""Double-clickable helper: Ultra HDR JPEG -> gain map AVIF.
 
-    py tools/run_avif_gainmap.py [base.png gainmap.png gainmap.json] [-o out.avif]
+    py tools/run_avif_gainmap.py [photo_ultrahdr.jpg] [-o out.avif] [--dry-run]
 
-With no arguments it uses the sample files already in tools/ (1_base.png,
-1_gainmap.png, 1_gainmap.json) and writes 1_gainmap.avif next to them.
-Resolves its own absolute path so it works from any working directory.
+With no arguments it looks for *_ultrahdr.jpg files in the current directory,
+then in tools/. Resolves its own absolute path so it works from any directory.
 """
 
+import glob
 import os
 import subprocess
 import sys
@@ -15,24 +15,25 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "avif_gainmap.py")
 
-SAMPLES = [
-    os.path.join(HERE, "1_base.png"),
-    os.path.join(HERE, "1_gainmap.png"),
-    os.path.join(HERE, "1_gainmap.json"),
-]
-
 if not os.path.exists(SCRIPT):
     sys.exit(f"script not found: {SCRIPT}")
 
 args = sys.argv[1:]
-if not args:
-    args = SAMPLES
+if not args or (len(args) == 1 and not args[0].endswith(".jpg") and not args[0].endswith(".jpeg")):
+    candidates = glob.glob("*_ultrahdr.jpg") + glob.glob(os.path.join(HERE, "*_ultrahdr.jpg"))
+    if not candidates:
+        print("no *_ultrahdr.jpg found; drop one as an argument")
+        sys.exit(1)
+    args = [candidates[0]] + args if args else [candidates[0]]
 
-# avifgainmaputil ships next to the script; point at it so the AVIF is actually
-# produced instead of falling back to a PATH lookup.
+# the libavif tools ship next to the script; prefer them over a PATH lookup.
+# avifenc is the fallback encoder when avifgainmaputil lacks libxml2.
 gainmaputil = os.path.join(HERE, "avifgainmaputil.exe")
 if os.path.exists(gainmaputil) and "--gainmaputil" not in args:
     args += ["--gainmaputil", gainmaputil]
+avifenc = os.path.join(HERE, "avifenc.exe")
+if os.path.exists(avifenc) and "--avifenc-bin" not in args:
+    args += ["--avifenc-bin", avifenc]
 
 rc = subprocess.call([sys.executable, SCRIPT, *args])
 if rc != 0:

@@ -90,13 +90,16 @@ function makeCanvas(w, h) {
 }
 
 const ids = {};
-['view', 'viewcol', 'saved', 'status', 'gpu', 'drop', 'open', 'patterns', 'controls', 'curve']
+['view', 'viewcol', 'viewwrap', 'saved', 'status', 'gpu', 'drop', 'open', 'patterns', 'controls', 'curve', 'histo']
 	.forEach(id => {
-		ids[id] = id === 'view' ? makeCanvas(900, 600) :
-			id === 'curve' ? makeCanvas(300, 190) : element('div');
+		ids[id] = (id === 'view' ? makeCanvas(900, 600) :
+			id === 'curve' ? makeCanvas(300, 190) :
+			id === 'histo' ? makeCanvas(900, 110) : element('div'));
 		ids[id].id = id;
 	});
 ids.viewcol.clientWidth = 900;
+ids.viewwrap.clientWidth = 900;
+ids.viewwrap.clientHeight = 600;
 
 global.document = {
 	getElementById: (id) => ids[id] || null,
@@ -211,12 +214,14 @@ function findButton(label, node) {
 		process.exit(2);
 	}
 
-	check('three pipelines', calls.pipelines === 3, calls.pipelines);
+	check('four pipelines (gain/apply/present/hist)', calls.pipelines === 4, calls.pipelines);
 	check('three passes per render', calls.passes === 3, calls.passes);
 	check('gain map is 1/4 of source',
 		calls.textures.includes('rgba8unorm 320x200'), calls.textures.join(' | '));
 	check('hdr texture is rgba16float',
 		calls.textures.includes('rgba16float 1280x800'), calls.textures.join(' | '));
+	check('histogram texture allocated',
+		calls.textures.includes('rgba16float 192x108'), calls.textures.join(' | '));
 	check('gpu line reports HDR canvas', /HDR canvas on/.test(ids.gpu.textContent),
 		ids.gpu.textContent);
 
@@ -228,9 +233,11 @@ function findButton(label, node) {
 	check('report written', report.textContent.length > 20, JSON.stringify(report.textContent));
 	check('report mentions the gain map', /gain map\s+64×64/.test(report.textContent));
 	check('report mentions the boost', /boost\)/.test(report.textContent));
+	check('report mentions capacity (separate from range)', /capacity\s+0\.000 … 2\.300/,
+		report.textContent);
 	check('gain map was read back for encoding', calls.readbacks >= 1, calls.readbacks);
 
-	const exportPair = findButton('export png pair + json');
+	const exportPair = findButton('export jpeg pair + json');
 	check('export button exists', !!exportPair);
 
 	check('no unhandled rejections', errors.length === 0, errors.map(String).join(' | '));

@@ -11,6 +11,14 @@
 		flat: [[0, 0.5], [1, 0.5]]
 	};
 
+	// Parametric "highlights" curve: nothing below `threshold`, then a monotone
+	// rise to 1.0 at white. The spline through three points gives a smooth S
+	// with a flat shadow region, which is what the quick tone sliders use.
+	function rampPoints(threshold) {
+		threshold = Math.min(0.99, Math.max(0.01, threshold));
+		return [[0, 0], [threshold, 0], [1, 1]];
+	}
+
 	// Fritsch-Carlson tangents: no overshoot, so the gain never rings.
 	function tangents(pts) {
 		var n = pts.length;
@@ -176,6 +184,7 @@
 	var api = {
 		PRESETS: PRESETS,
 		sample: sample,
+		rampPoints: rampPoints,
 		evalAt: function (points, x) { return evalAt(points, tangents(points), x); },
 		editor: editor
 	};

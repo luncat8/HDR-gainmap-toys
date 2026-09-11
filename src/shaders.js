@@ -100,14 +100,23 @@ fn fs_apply(in : VSOut) -> @location(0) vec4f {
 }
 
 // present pass: linear HDR -> extended sRGB canvas.
+// mode: 0 = HDR, 2 = gain map (gray), 3 = SDR base (sRGB bytes passthrough).
 @fragment
 fn fs_present(in : VSOut) -> @location(0) vec4f {
   let c = textureSampleLevel(tex0, samp, in.uv, 0.0);
+  if (P.b.z > 2.5) { return vec4f(c.rgb, 1.0); }
   let scale = exp2(P.b.x);
   let rgb = select(c.rgb, vec3f(c.r), P.b.z > 1.5);
-  var v = rgb * scale;
-  if (P.b.z > 0.5 && P.b.z < 1.5) { v = min(v, vec3f(1.0)); }  // clamp-to-SDR compare
-  return vec4f(linearToSrgb(v), 1.0);
+  return vec4f(linearToSrgb(rgb * scale), 1.0);
+}
+
+// histogram pass: log2 luma of two textures at low resolution, read back on
+// the CPU and binned. tex0 is sRGB encoded (decoded here), tex1 is linear.
+@fragment
+fn fs_hist(in : VSOut) -> @location(0) vec4f {
+  let a = srgbToLinear(textureSampleLevel(tex0, samp, in.uv, 0.0).rgb);
+  let b = textureSampleLevel(tex1, samp, in.uv, 0.0).rgb;
+  return vec4f(log2(max(luma(a), 1e-6)), log2(max(luma(b), 1e-6)), 0.0, 1.0);
 }
 `;
 

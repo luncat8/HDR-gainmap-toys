@@ -9,8 +9,13 @@
 
 * { box-sizing: border-box; }
 
+html, body { height: 100%; }
+
 body {
 	margin: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
 	background: var(--bg);
 	color: var(--text);
 	font: 13px/1.5 system-ui, -apple-system, sans-serif;
@@ -50,7 +55,8 @@ main {
 	grid-template-columns: minmax(0, 1fr) 340px;
 	gap: 16px;
 	padding: 16px;
-	align-items: start;
+	flex: 1;
+	min-height: 0;
 }
 
 .stage {
@@ -58,6 +64,7 @@ main {
 	flex-direction: column;
 	gap: 12px;
 	min-width: 0;
+	min-height: 0;
 }
 
 #drop {
@@ -100,7 +107,11 @@ main {
 }
 
 #viewcol {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
 	min-width: 0;
+	min-height: 0;
 	background: #000;
 	border: 1px solid var(--line);
 	border-radius: 8px;
@@ -108,18 +119,48 @@ main {
 	line-height: 0;
 }
 
-canvas#view {
-	display: block;
-	width: 100%;
-	height: auto;
+/* the view canvas is letterboxed: fit the free space, keep the aspect ratio */
+#viewwrap {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex: 1;
+	min-height: 0;
 }
 
-.saved {
+canvas#view {
+	display: block;
+	max-width: 100%;
+	max-height: 100%;
+}
+
+canvas#histo {
+	display: block;
+	width: 100%;
+	height: 110px;
+	flex: none;
+	border-top: 1px solid var(--line);
+	background: #0e1117;
+}
+
+aside {
 	background: var(--panel);
 	border: 1px solid var(--line);
 	border-radius: 8px;
-	padding: 10px 12px;
+	padding: 12px;
+	min-height: 0;
+	overflow-y: auto;
 }
+
+.saved {
+	display: none;
+	border-top: 1px solid var(--line);
+	margin-top: 10px;
+	padding-top: 10px;
+}
+
+/* hidden until the first save gives the img a src */
+.saved:has(img[src]) { display: block; }
 
 .saved h3 {
 	margin: 0 0 8px;
@@ -133,15 +174,8 @@ canvas#view {
 .saved img {
 	display: block;
 	max-width: 100%;
-	max-height: 240px;
+	max-height: 160px;
 	background: #000;
-}
-
-aside {
-	background: var(--panel);
-	border: 1px solid var(--line);
-	border-radius: 8px;
-	padding: 12px;
 }
 
 aside > canvas {
@@ -255,4 +289,7 @@ pre.report {
 
 @media (max-width: 900px) {
 	main { grid-template-columns: minmax(0, 1fr); }
+	/* stacked columns need page scroll again; the view still fits by height */
+	body { overflow: auto; }
+	#viewcol { min-height: 320px; }
 }

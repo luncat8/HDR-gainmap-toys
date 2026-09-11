@@ -1,0 +1,15 @@
+{
+ "gainMapMin": 0.45,
+ "gainMapMax": 4.189824558880018,
+ "hdrCapacityMin": 0.45,
+ "hdrCapacityMax": 4.189824558880018,
+ "offsetSDR": 0,
+ "offsetHDR": 0,
+ "gamma": 1,
+ "baseWidth": 1634,
+ "baseHeight": 512,
+ "gainMapWidth": 409,
+ "gainMapHeight": 128,
+ "sdrWhiteNits": 80,
+ "peakNits": 1460
+}

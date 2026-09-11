@@ -1,9 +1,19 @@
 // HDR gain map toy: SDR source -> authored HDR -> Ultra HDR JPEG -> check.
+//
+// Tone model (stops): the editable curve maps SDR luminance (0..1) to a
+// normalised boost t (0..1). log2 gain = shadowLift + t * (highlightGain -
+// shadowLift), so the gain map range is [shadowLift, highlightGain] stops.
+// peakNits is separate: it only sets the HDR capacity metadata (and caps
+// highlightGain), i.e. the display headroom the file is mastered for.
 (function () {
 	'use strict';
 
 	var SAMPLES = SHADERS.LUT_SAMPLES;
 	var MAX_WORK = 4096;   // working resolution cap: rgba16float + jpeg encode
+
+	// histogram: low-res readback is binned on the CPU
+	var HIST_W = 192, HIST_H = 108, HIST_BINS = 256;
+	var HIST_MIN_STOP = -10, HIST_MAX_STOP = 6;
 
 	var state = {
 		sourceName: '',
@@ -13,39 +23,73 @@
 		params: {
 			peakNits: 1000,
 			sdrWhite: 203,
-			floorStops: 0,
+			shadowLift: 0,     // stops, curve bottom = GainMapMin
+			highlightGain: 0,  // stops, curve top = GainMapMax (<= capacity)
+			threshold: 0.55,   // luminance where the highlight ramp starts
 			gainScale: 4,
 			exposure: 0,
 			headroom: 4,
 			baseQuality: 92,
-			gainQuality: 85
+			gainQuality: 85,
+			histogram: true,
+			histLog: true
 		},
 		view: 'hdr',
-		curve: { points: CURVE.PRESETS.highlights.map(function (p) { return p.slice(); }) },
+		curve: { points: null },
 		lut: null,
+		lutMin: 0,
+		lutMax: 1,
 		file: null
 	};
 
 	var gpu = null, device = null, context = null;
-	var srcTex = null, gainTex = null, hdrTex = null;
+	var srcTex = null, gainTex = null, hdrTex = null, histTex = null;
 	var fileBaseTex = null, fileGainTex = null, fileMeta = null;
 	var gainW = 0, gainH = 0;
 	var ubo = null, samp = null;
-	var gainPipe = null, applyPipe = null, presentPipe = null;
-	var bgGain = null, bgApply = null, bgFileApply = null, bgPresent = null, bgGainView = null;
+	var gainPipe = null, applyPipe = null, presentPipe = null, histPipe = null;
+	var bgGain = null, bgApply = null, bgFileApply = null, bgPresent = null;
+	var bgGainView = null, bgHist = null, bgBase = null;
 	var params = new Float32Array(12 + SAMPLES);
+	var histSrc = new Float32Array(HIST_BINS);
+	var histRes = new Float32Array(HIST_BINS);
+	var histGen = 0, histScheduled = false;
 	var controls = {};
 	var dom = {};
 	var curveView = null;
+	var lastCap = 0;
 
 	// ── derived ──────────────────────────────────────────────────────────────
 
-	function maxStops() {
+	function capacityMax() {
 		return Math.log2(state.params.peakNits / state.params.sdrWhite);
 	}
 
 	function minStops() {
-		return Math.min(state.params.floorStops, maxStops() - 0.01);
+		return state.params.shadowLift;
+	}
+
+	// curve top, clamped into [shadowLift + epsilon, capacity]
+	function maxStops() {
+		var cap = capacityMax();
+		var lo = minStops() + 0.01;
+		return Math.min(cap, Math.max(lo, state.params.highlightGain));
+	}
+
+	function spanStops() {
+		return maxStops() - minStops();
+	}
+
+	function rangeMin() {
+		return minStops() + state.lutMin * spanStops();
+	}
+
+	function rangeMax() {
+		return minStops() + state.lutMax * spanStops();
+	}
+
+	function capacityMin() {
+		return Math.max(rangeMin(), 0);
 	}
 
 	function gainSize() {
@@ -78,6 +122,7 @@
 		gainPipe = pipe('fs_gain', GPUX.RGBA8);
 		applyPipe = pipe('fs_apply', GPUX.HDRTEX);
 		presentPipe = pipe('fs_present', GPUX.HDRTEX);
+		histPipe = pipe('fs_hist', GPUX.HDRTEX);
 	}
 
 	var bgLayout = null;
@@ -95,18 +140,21 @@
 	}
 
 	function allocForSource() {
-		[srcTex, gainTex, hdrTex].forEach(function (t) { if (t) t.destroy(); });
+		[srcTex, gainTex, hdrTex, histTex].forEach(function (t) { if (t) t.destroy(); });
 		var gs = gainSize();
 		gainW = gs[0];
 		gainH = gs[1];
 		srcTex = GPUX.imageTexture(device, state.srcW, state.srcH);
 		gainTex = GPUX.renderTexture(device, gainW, gainH, GPUX.RGBA8);
 		hdrTex = GPUX.renderTexture(device, state.srcW, state.srcH, GPUX.HDRTEX);
+		histTex = GPUX.renderTexture(device, HIST_W, HIST_H, GPUX.HDRTEX);
 		GPUX.uploadImage(device, srcTex, state.source, state.srcW, state.srcH);
 		bgGain = bindGroup(srcTex, srcTex);
 		bgApply = bindGroup(srcTex, gainTex);
 		bgPresent = bindGroup(hdrTex, hdrTex);
 		bgGainView = bindGroup(gainTex, gainTex);
+		bgHist = bindGroup(srcTex, hdrTex);
+		bgBase = bindGroup(srcTex, srcTex);
 	}
 
 	function allocForFile(w, h, gw, gh, base, gain) {
@@ -118,12 +166,12 @@
 		bgFileApply = bindGroup(fileBaseTex, fileGainTex);
 	}
 
-	// One uniform write per frame: the three passes use disjoint fields.
+	// One uniform write per frame: the passes use disjoint fields.
 	function writeParams(p) {
-		params[0] = p.minStops;
-		params[1] = p.maxStops;
-		params[2] = Math.max(p.minStops, 0);
-		params[3] = p.maxStops;
+		params[0] = p.rangeMin;
+		params[1] = p.rangeMax;
+		params[2] = p.capacityMin;
+		params[3] = p.capacityMax;
 		params[4] = p.exposure;
 		params[5] = Math.log2(p.headroom);
 		params[6] = p.mode;
@@ -136,18 +184,27 @@
 		device.queue.writeBuffer(ubo, 0, params);
 	}
 
-	var MODES = { hdr: 0, sdr: 1, gain: 2 };
+	var MODES = { hdr: 0, sdr: 3, gain: 2 };
+
+	function presentGroup() {
+		if (state.view === 'gain') return bgGainView;
+		if (state.view === 'sdr') return bgBase;
+		return bgPresent;
+	}
 
 	function render() {
 		if (!device || !srcTex) return;
 		var useFile = state.view === 'file' && bgFileApply;
-		var headroom = useFile ? 1e6 : state.params.headroom; // decoded view: show intent
-		var fileMin = fileMeta ? fileMeta.gainMapMin : 0;
-		var fileMax = fileMeta ? fileMeta.gainMapMax : 1;
+		// live authoring shows the full authored HDR (weight = 1, the canvas
+		// tone maps); only the decoded-file view adapts to the display headroom.
+		var headroom = useFile ? state.params.headroom : 1e6;
+		var m = fileMeta || {};
 
 		writeParams({
-			minStops: useFile ? fileMin : minStops(),
-			maxStops: useFile ? fileMax : maxStops(),
+			rangeMin: useFile ? (m.gainMapMin !== undefined ? m.gainMapMin : 0) : rangeMin(),
+			rangeMax: useFile ? (m.gainMapMax !== undefined ? m.gainMapMax : 1) : rangeMax(),
+			capacityMin: useFile ? (m.hdrCapacityMin !== undefined ? m.hdrCapacityMin : 0) : capacityMin(),
+			capacityMax: useFile ? (m.hdrCapacityMax !== undefined ? m.hdrCapacityMax : 1) : capacityMax(),
 			exposure: state.view === 'gain' ? 0 : state.params.exposure,
 			headroom: headroom,
 			mode: MODES[state.view] === undefined ? 0 : MODES[state.view],
@@ -189,8 +246,143 @@
 				loadOp: 'clear',
 				storeOp: 'store'
 			}]
-		}), presentPipe, state.view === 'gain' ? bgGainView : bgPresent);
+		}), presentPipe, presentGroup());
 		device.queue.submit([enc.finish()]);
+		scheduleHist();
+	}
+
+	// ── histogram ────────────────────────────────────────────────────────────
+
+	function scheduleHist() {
+		if (!state.params.histogram || !histTex || !bgHist) return;
+		if (typeof requestAnimationFrame !== 'function') return;
+		if (histScheduled) return;
+		histScheduled = true;
+		requestAnimationFrame(function () {
+			histScheduled = false;
+			updateHistogram();
+		});
+	}
+
+	async function updateHistogram() {
+		if (!histTex || !bgHist) return;
+		var gen = ++histGen;
+		var enc = device.createCommandEncoder();
+		GPUX.draw(enc.beginRenderPass({
+			colorAttachments: [{
+				view: histTex.createView(),
+				clearValue: { r: 0, g: 0, b: 0, a: 1 },
+				loadOp: 'clear',
+				storeOp: 'store'
+			}]
+		}), histPipe, bgHist);
+		device.queue.submit([enc.finish()]);
+		var raw = await GPUX.readTexture(device, histTex, HIST_W, HIST_H, GPUX.HDRTEX);
+		if (gen !== histGen) return;
+		binHistogram(GPUX.halfRowsToFloat(raw, HIST_W, HIST_H));
+		drawHistogram();
+	}
+
+	function addBin(arr, v) {
+		var t = (v - HIST_MIN_STOP) / (HIST_MAX_STOP - HIST_MIN_STOP);
+		var b = t < 0 ? 0 : t >= 1 ? HIST_BINS - 1 : (t * HIST_BINS) | 0;
+		arr[b]++;
+	}
+
+	function binHistogram(f) {
+		histSrc.fill(0);
+		histRes.fill(0);
+		for (var i = 0; i < f.length; i += 4) {
+			addBin(histSrc, f[i]);
+			addBin(histRes, f[i + 1]);
+		}
+	}
+
+	function histMax() {
+		var m = 1;
+		for (var i = 0; i < HIST_BINS; i++) {
+			if (histSrc[i] > m) m = histSrc[i];
+			if (histRes[i] > m) m = histRes[i];
+		}
+		return m;
+	}
+
+	function drawHistogram() {
+		var c = dom.histo;
+		var ctx = c.getContext('2d');
+		var w = c.width, h = c.height;
+		var padL = 30, padR = 8, padT = 8, padB = 16;
+		var plotW = w - padL - padR, plotH = h - padT - padB;
+		ctx.clearRect(0, 0, w, h);
+		ctx.fillStyle = '#0e1117';
+		ctx.fillRect(0, 0, w, h);
+		if (plotW < 20 || plotH < 10) return;
+
+		var maxN = histMax();
+		var log = state.params.histLog;
+		var denom = log ? Math.log1p(maxN) : maxN;
+		function yOf(v) {
+			var n = log ? Math.log1p(v) : v;
+			return padT + plotH * (1 - n / denom);
+		}
+		function xOf(b) {
+			return padL + plotW * (b / (HIST_BINS - 1));
+		}
+
+		// grid at each stop, with the SDR white (0 stops) line emphasised
+		ctx.lineWidth = 1;
+		ctx.font = '10px system-ui, sans-serif';
+		for (var s = HIST_MIN_STOP; s <= HIST_MAX_STOP; s++) {
+			var x = padL + plotW * ((s - HIST_MIN_STOP) / (HIST_MAX_STOP - HIST_MIN_STOP));
+			ctx.strokeStyle = s === 0 ? '#4a5260' : '#20252e';
+			ctx.beginPath();
+			ctx.moveTo(x + 0.5, padT);
+			ctx.lineTo(x + 0.5, padT + plotH);
+			ctx.stroke();
+			ctx.fillStyle = '#5b6472';
+			ctx.fillText((s >= 0 ? '+' : '') + s, x - 4, h - 4);
+		}
+
+		strokeHist(ctx, histSrc, '#5b6472', padL, padT, plotW, plotH, yOf, xOf);
+		strokeHist(ctx, histRes, '#7fd4ff', padL, padT, plotW, plotH, yOf, xOf);
+
+		// markers: display headroom and mastered peak
+		markHist(ctx, Math.log2(state.params.headroom), '#e8eef7', padL, padT, plotW, plotH);
+		markHist(ctx, capacityMax(), '#ffd479', padL, padT, plotW, plotH);
+	}
+
+	function strokeHist(ctx, arr, color, padL, padT, plotW, plotH, yOf, xOf) {
+		ctx.strokeStyle = color;
+		ctx.fillStyle = color;
+		ctx.globalAlpha = 0.45;
+		ctx.lineWidth = 1.5;
+		ctx.beginPath();
+		ctx.moveTo(xOf(0), padT + plotH);
+		for (var i = 0; i < HIST_BINS; i++) {
+			ctx.lineTo(xOf(i), yOf(arr[i]));
+		}
+		ctx.lineTo(xOf(HIST_BINS - 1), padT + plotH);
+		ctx.closePath();
+		ctx.fill();
+		ctx.globalAlpha = 1;
+		ctx.beginPath();
+		for (var j = 0; j < HIST_BINS; j++) {
+			var yy = yOf(arr[j]);
+			if (j === 0) ctx.moveTo(xOf(0), yy);
+			else ctx.lineTo(xOf(j), yy);
+		}
+		ctx.stroke();
+	}
+
+	function markHist(ctx, stop, color, padL, padT, plotW, plotH) {
+		var x = padL + plotW * ((stop - HIST_MIN_STOP) / (HIST_MAX_STOP - HIST_MIN_STOP));
+		if (x < padL || x > padL + plotW) return;
+		ctx.strokeStyle = color;
+		ctx.lineWidth = 1;
+		ctx.beginPath();
+		ctx.moveTo(x + 0.5, padT);
+		ctx.lineTo(x + 0.5, padT + plotH);
+		ctx.stroke();
 	}
 
 	// ── source ───────────────────────────────────────────────────────────────
@@ -213,6 +405,7 @@
 		dom.viewRadio.set('hdr');
 		state.view = 'hdr';
 		fitCanvas();
+		fitHisto();
 		allocForSource();
 		render();
 		status(name + ' — ' + state.srcW + '×' + state.srcH +
@@ -220,10 +413,16 @@
 	}
 
 	function fitCanvas() {
-		var maxW = Math.min(1100, dom.viewCol.clientWidth || 900);
-		var k = Math.min(1, maxW / state.srcW);
+		var maxW = dom.viewWrap.clientWidth || 900;
+		var maxH = dom.viewWrap.clientHeight || 600;
+		var k = Math.min(1, maxW / state.srcW, maxH / state.srcH);
 		dom.canvas.width = Math.max(1, Math.round(state.srcW * k));
 		dom.canvas.height = Math.max(1, Math.round(state.srcH * k));
+	}
+
+	function fitHisto() {
+		if (!dom.histo) return;
+		dom.histo.width = Math.max(64, dom.viewCol.clientWidth || 900);
 	}
 
 	function usePattern(kind) {
@@ -239,7 +438,7 @@
 		}
 	}
 
-	// ── save ─────────────────────────────────────────────────────────────────
+	// ── encode / save ────────────────────────────────────────────────────────
 
 	function toBlob(source, w, h, type, quality) {
 		var c = PATTERNS.canvasOf(w, h);
@@ -265,9 +464,19 @@
 		return new ImageData(data, w, h);
 	}
 
-	async function save() {
-		if (!srcTex) return;
-		status('encoding…');
+	function buildMeta() {
+		return {
+			gainMapMin: rangeMin(),
+			gainMapMax: rangeMax(),
+			hdrCapacityMin: capacityMin(),
+			hdrCapacityMax: capacityMax(),
+			offsetSDR: 0,
+			offsetHDR: 0,
+			gamma: 1
+		};
+	}
+
+	async function encodePair() {
 		var p = state.params;
 		var baseBlob = await toBlob(state.source, state.srcW, state.srcH,
 			'image/jpeg', p.baseQuality / 100);
@@ -277,24 +486,25 @@
 		var gmBlob = await new Promise(function (resolve) {
 			gmCanvas.toBlob(resolve, 'image/jpeg', p.gainQuality / 100);
 		});
-
-		var meta = {
-			gainMapMin: minStops(),
-			gainMapMax: maxStops(),
-			hdrCapacityMin: Math.max(minStops(), 0),
-			hdrCapacityMax: maxStops(),
-			offsetSDR: 0,
-			offsetHDR: 0,
-			gamma: 1
+		return {
+			base: await bytesOf(baseBlob),
+			gain: await bytesOf(gmBlob),
+			meta: buildMeta()
 		};
-		var built = UHDR.buildUltraHDR(await bytesOf(baseBlob), await bytesOf(gmBlob), meta);
+	}
+
+	async function save() {
+		if (!srcTex) return;
+		status('encoding…');
+		var pair = await encodePair();
+		var built = UHDR.buildUltraHDR(pair.base, pair.gain, pair.meta);
 		var blob = new Blob([built.bytes], { type: 'image/jpeg' });
 
 		state.file = { blob: blob, bytes: built.bytes, meta: built.meta, built: built };
 		if (state.file.url) URL.revokeObjectURL(state.file.url);
 		state.file.url = URL.createObjectURL(blob);
 
-		var stem = (state.sourceName || 'image').replace(/\.[^.]+$/, '');
+		var stem = stemOf();
 		dom.img.src = state.file.url;
 		dom.link.href = state.file.url;
 		dom.link.download = stem + '_ultrahdr.jpg';
@@ -366,34 +576,26 @@
 
 	async function exportPair() {
 		if (!srcTex) return;
-		var p = state.params;
-		var base = await toBlob(state.source, state.srcW, state.srcH, 'image/png');
-		var raw = await GPUX.readTexture(device, gainTex, gainW, gainH, GPUX.RGBA8);
-		var gmCanvas = PATTERNS.canvasOf(gainW, gainH);
-		gmCanvas.getContext('2d').putImageData(gainImageData(raw, gainW, gainH), 0, 0);
-		var gm = await new Promise(function (r) { gmCanvas.toBlob(r, 'image/png'); });
-
-		var stem = (state.sourceName || 'image').replace(/\.[^.]+$/, '');
-		saveBlob(base, stem + '_base.png');
-		saveBlob(gm, stem + '_gainmap.png');
-		var meta = {
-			gainMapMin: minStops(),
-			gainMapMax: maxStops(),
-			hdrCapacityMin: Math.max(minStops(), 0),
-			hdrCapacityMax: maxStops(),
-			offsetSDR: 0,
-			offsetHDR: 0,
-			gamma: 1,
+		status('encoding…');
+		var pair = await encodePair();
+		var stem = stemOf();
+		saveBlob(new Blob([pair.base], { type: 'image/jpeg' }), stem + '_base.jpg');
+		saveBlob(new Blob([pair.gain], { type: 'image/jpeg' }), stem + '_gainmap.jpg');
+		var meta = Object.assign({}, pair.meta, {
 			baseWidth: state.srcW,
 			baseHeight: state.srcH,
 			gainMapWidth: gainW,
 			gainMapHeight: gainH,
 			sdrWhiteNits: state.params.sdrWhite,
 			peakNits: state.params.peakNits
-		};
+		});
 		saveBlob(new Blob([JSON.stringify(meta, null, 1)], { type: 'application/json' }),
 			stem + '_gainmap.json');
-		status('exported base.png + gainmap.png + json — run tools/avif_gainmap.py');
+		status('exported base.jpg + gainmap.jpg + json — run tools/avif_gainmap.py');
+	}
+
+	function stemOf() {
+		return (state.sourceName || 'image').replace(/\.[^.]+$/, '');
 	}
 
 	function saveBlob(blob, name) {
@@ -419,6 +621,8 @@
 				'  ' + (info.gainLength / 1024).toFixed(1) + ' KB',
 			'range    ' + m.gainMapMin.toFixed(3) + ' … ' + m.gainMapMax.toFixed(3) + ' stops  (' +
 				Math.pow(2, info.stops).toFixed(2) + '× boost)',
+			'capacity ' + m.hdrCapacityMin.toFixed(3) + ' … ' + m.hdrCapacityMax.toFixed(3) +
+				' stops  (' + Math.pow(2, m.hdrCapacityMax).toFixed(2) + '× display)',
 			'MPF      image 2 at byte ' + info.parsed.gainMapOffset +
 				', ' + info.parsed.images[1].size + ' bytes'
 		];
@@ -441,22 +645,47 @@
 
 	// ── ui ───────────────────────────────────────────────────────────────────
 
+	function refreshRange() {
+		var cap = capacityMax();
+		var wasAtMax = lastCap > 0 && Math.abs(state.params.highlightGain - lastCap) < 1e-4;
+		lastCap = cap;
+		controls.highlightGain.input.max = cap.toFixed(4);
+		if (wasAtMax) state.params.highlightGain = cap;
+		if (state.params.highlightGain < minStops() + 0.01) state.params.highlightGain = minStops() + 0.01;
+		if (state.params.highlightGain > cap) state.params.highlightGain = cap;
+		controls.highlightGain.set(state.params.highlightGain);
+	}
+
 	function buildUI() {
 		var p = state.params;
+
+		controls.shadowLift = UI.slider({
+			label: 'shadow lift', min: -2, max: 1, step: 0.05, value: p.shadowLift,
+			format: function (v) { return v.toFixed(2) + ' stops'; },
+			onInput: function (v) { p.shadowLift = v; render(); }
+		});
+		controls.highlightGain = UI.slider({
+			label: 'highlight gain', min: 0, max: capacityMax(), step: 0.05, value: capacityMax(),
+			format: function (v) { return v.toFixed(2) + ' stops'; },
+			onInput: function (v) { p.highlightGain = v; render(); }
+		});
+		controls.threshold = UI.slider({
+			label: 'highlight threshold', min: 0.05, max: 1, step: 0.01, value: p.threshold,
+			format: function (v) { return v.toFixed(2) + ' Y'; },
+			onInput: function (v) {
+				p.threshold = v;
+				setCurve(CURVE.rampPoints(v));
+			}
+		});
 		controls.peakNits = UI.slider({
 			label: 'peak nits', min: 100, max: 4000, step: 10, value: p.peakNits,
 			format: function (v) { return v.toFixed(0) + ' nits'; },
-			onInput: function (v) { p.peakNits = v; render(); }
+			onInput: function (v) { p.peakNits = v; refreshRange(); render(); }
 		});
 		controls.sdrWhite = UI.slider({
 			label: 'SDR white', min: 80, max: 400, step: 1, value: p.sdrWhite,
 			format: function (v) { return v.toFixed(0) + ' nits'; },
-			onInput: function (v) { p.sdrWhite = v; render(); }
-		});
-		controls.floorStops = UI.slider({
-			label: 'floor gain', min: -2, max: 1, step: 0.05, value: p.floorStops,
-			format: function (v) { return v.toFixed(2) + ' stops'; },
-			onInput: function (v) { p.floorStops = v; render(); }
+			onInput: function (v) { p.sdrWhite = v; refreshRange(); render(); }
 		});
 		controls.gainScale = UI.select({
 			label: 'gain map scale', value: String(p.gainScale),
@@ -487,25 +716,37 @@
 			label: 'gain map quality', min: 50, max: 100, step: 1, value: p.gainQuality,
 			onInput: function (v) { p.gainQuality = v; }
 		});
+		controls.histogram = UI.checkbox({
+			label: 'histogram', value: p.histogram,
+			onChange: function (v) { p.histogram = v; if (v) scheduleHist(); }
+		});
+		controls.histLog = UI.checkbox({
+			label: 'log', value: p.histLog,
+			onChange: function (v) { p.histLog = v; drawHistogram(); }
+		});
+
+		dom.controls.appendChild(UI.el('div', { class: 'group' }, [
+			UI.el('h3', { text: 'tone — luminance → boost (stops)' }),
+			controls.shadowLift.row,
+			controls.highlightGain.row,
+			controls.threshold.row
+		]));
 
 		dom.controls.appendChild(UI.el('div', { class: 'group' }, [
 			UI.el('h3', { text: 'HDR range' }),
 			controls.peakNits.row,
 			controls.sdrWhite.row,
-			controls.floorStops.row,
 			controls.gainScale.row
 		]));
 
 		dom.controls.appendChild(UI.el('div', { class: 'group' }, [
-			UI.el('h3', { text: 'curve — luminance → boost' }),
+			UI.el('h3', { text: 'curve — fine edit' }),
 			dom.curveBox,
 			UI.el('div', { class: 'buttons' }, Object.keys(CURVE.PRESETS).map(function (name) {
 				return UI.el('button', {
 					type: 'button', text: name,
 					onclick: function () {
-						state.curve.points = CURVE.PRESETS[name].map(function (pt) { return pt.slice(); });
-						curveChanged();
-						curveView.draw();
+						setCurve(CURVE.PRESETS[name].map(function (pt) { return pt.slice(); }));
 					}
 				});
 			}))
@@ -515,7 +756,8 @@
 			UI.el('h3', { text: 'preview' }),
 			dom.viewRow.row,
 			controls.exposure.row,
-			controls.headroom.row
+			controls.headroom.row,
+			UI.el('div', { class: 'chips' }, [controls.histogram.row, controls.histLog.row])
 		]));
 
 		dom.controls.appendChild(UI.el('div', { class: 'group' }, [
@@ -524,16 +766,35 @@
 			controls.gainQuality.row,
 			UI.buttons([
 				{ label: 'save ultra hdr jpeg', onClick: save, title: 'writes SDR + gain map + XMP + MPF' },
-				{ label: 'export png pair + json', onClick: exportPair, title: 'for tools/avif_gainmap.py' }
+				{ label: 'export jpeg pair + json', onClick: exportPair, title: 'for tools/avif_gainmap.py' }
 			]),
 			dom.link,
 			UI.el('pre', { class: 'report' })
 		]));
-		dom.report = dom.controls.querySelector('.report');
+	dom.report = dom.controls.querySelector('.report');
+	dom.controls.appendChild(dom.img.parentNode);  // saved-file thumbnail goes last
+}
+
+	function refreshLut() {
+		state.lut = CURVE.sample(state.curve.points, SAMPLES);
+		var mn = 1, mx = 0;
+		for (var i = 0; i < state.lut.length; i++) {
+			if (state.lut[i] < mn) mn = state.lut[i];
+			if (state.lut[i] > mx) mx = state.lut[i];
+		}
+		state.lutMin = mn;
+		state.lutMax = mx;
+	}
+
+	function setCurve(points) {
+		state.curve.points = points;
+		refreshLut();
+		curveView.draw();
+		render();
 	}
 
 	function curveChanged() {
-		state.lut = CURVE.sample(state.curve.points, SAMPLES);
+		refreshLut();
 		render();
 	}
 
@@ -541,7 +802,9 @@
 
 	async function main() {
 		dom.canvas = document.getElementById('view');
+		dom.histo = document.getElementById('histo');
 		dom.viewCol = document.getElementById('viewcol');
+		dom.viewWrap = document.getElementById('viewwrap');
 		dom.img = document.getElementById('saved');
 		dom.controls = document.getElementById('controls');
 		dom.status = document.getElementById('status');
@@ -551,17 +814,20 @@
 		dom.link = UI.el('a', { class: 'hidden', text: 'download ultra hdr jpeg' });
 
 		dom.viewRow = UI.radio('view', [
-			{ value: 'hdr', label: 'HDR' },
-			{ value: 'sdr', label: 'clamped' },
+			{ value: 'hdr', label: 'HDR (full)' },
+			{ value: 'sdr', label: 'SDR base' },
 			{ value: 'gain', label: 'gain map' },
-			{ value: 'file', label: 'saved file' }
+			{ value: 'file', label: 'saved file (adapted)' }
 		], 'hdr', function (v) {
 			state.view = v;
 			render();
 		});
 		dom.viewRadio = dom.viewRow;
 
+		state.curve.points = CURVE.rampPoints(state.params.threshold);
 		curveView = CURVE.editor(dom.curveBox, state.curve, curveChanged);
+		lastCap = capacityMax();
+		state.params.highlightGain = lastCap;
 
 		try {
 			gpu = await GPUX.init(dom.canvas);
@@ -584,7 +850,8 @@
 
 		buildUI();
 		controls.headroom.set(state.params.headroom);
-		state.lut = CURVE.sample(state.curve.points, SAMPLES);
+		refreshLut();
+		fitHisto();
 
 		dom.drop.addEventListener('dragover', function (e) {
 			e.preventDefault();
@@ -608,6 +875,7 @@
 		window.addEventListener('resize', function () {
 			if (!srcTex) return;
 			fitCanvas();
+			fitHisto();
 			render();
 		});
 

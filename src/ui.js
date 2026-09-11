@@ -72,6 +72,17 @@
 		}));
 	}
 
+	function checkbox(def) {
+		var input = el('input', { type: 'checkbox' });
+		input.checked = !!def.value;
+		input.addEventListener('change', function () { def.onChange(input.checked); });
+		return {
+			row: el('label', { class: 'chip' }, [input, el('span', { text: def.label })]),
+			input: input,
+			set: function (v) { input.checked = v; }
+		};
+	}
+
 	function radio(name, options, value, onChange) {
 		var inputs = options.map(function (o) {
 			var input = el('input', { type: 'radio', name: name, value: o.value });
@@ -91,7 +102,7 @@
 		};
 	}
 
-	var api = { el: el, slider: slider, select: select, buttons: buttons, radio: radio };
+	var api = { el: el, slider: slider, select: select, buttons: buttons, radio: radio, checkbox: checkbox };
 	root.UI = api;
 	if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
