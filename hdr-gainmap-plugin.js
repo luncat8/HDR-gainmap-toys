@@ -136,17 +136,23 @@
 	var origGetContext = null;
 
 	function ensurePatch() {
+		// called ASAP, not only in init
+		if (typeof HTMLCanvasElement === 'undefined') return;
 		if (origGetContext) return;
-		if (!HTMLCanvasElement || !HTMLCanvasElement.prototype.getContext) return;
-		origGetContext = HTMLCanvasElement.prototype.getContext;
-		HTMLCanvasElement.prototype.getContext = function (type, opts) {
-			var ctx = origGetContext.call(this, type, opts);
-			if (type === 'webgpu' && ctx) {
-				wrapContext(this, ctx);
-			}
-			return ctx;
-		};
+		try {
+			if (!HTMLCanvasElement.prototype.getContext) return;
+			origGetContext = HTMLCanvasElement.prototype.getContext;
+			HTMLCanvasElement.prototype.getContext = function (type, opts) {
+				var ctx = origGetContext.call(this, type, opts);
+				if (type === 'webgpu' && ctx) {
+					wrapContext(this, ctx);
+				}
+				return ctx;
+			};
+		} catch (e) { console.warn('HDR plugin patch failed', e); }
 	}
+	// patch immediately so early getContext('webgpu') is caught
+	try { ensurePatch(); } catch (e) {}
 
 	function wrapContext(canvas, ctx) {
 		if (ctx._hdrPatched) return;
@@ -451,6 +457,38 @@ fn weight() -> f32 {
 		document.head.appendChild(style);
 	}
 
+	var perCanvasRoot = null;
+	var perCanvasButtons = [];
+	var optsGlobal = { perCanvasButton: true };
+
+	function injectCSS() {
+		if (document.getElementById('hdr-plugin-style')) return;
+		var style = document.createElement('style');
+		style.id = 'hdr-plugin-style';
+		style.textContent = `
+#hdr-capture-btn{position:fixed;right:18px;bottom:18px;z-index:99999;background:#0b0d12;color:#dfe6f0;border:1px solid #232936;border-radius:10px;padding:10px 14px;font:13px system-ui;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,0.5)}
+#hdr-capture-btn:hover{border-color:#7fd4ff}
+#hdr-plugin-panel{position:fixed;right:18px;bottom:62px;z-index:99999;width:380px;max-height:85vh;overflow:auto;background:#14171f;color:#dfe6f0;border:1px solid #232936;border-radius:12px;padding:12px;font:12px system-ui;box-shadow:0 20px 60px rgba(0,0,0,0.6)}
+#hdr-plugin-panel.hidden{display:none}
+#hdr-plugin-panel h3{margin:8px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:#8b95a6}
+#hdr-plugin-panel .row{display:grid;grid-template-columns:96px 1fr 60px;gap:6px;align-items:center;padding:3px 0}
+#hdr-plugin-panel .row .label{color:#8b95a6}
+#hdr-plugin-panel .row .value{text-align:right;font-variant-numeric:tabular-nums}
+#hdr-plugin-panel input[type=range]{width:100%;accent-color:#7fd4ff}
+#hdr-plugin-panel button{background:#1b202b;color:#dfe6f0;border:1px solid #232936;border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer;margin:2px}
+#hdr-plugin-panel button:hover{border-color:#7fd4ff}
+#hdr-plugin-panel canvas{width:100%;border:1px solid #232936;border-radius:6px;background:#0e1117}
+#hdr-plugin-panel .canvas-list{display:flex;flex-direction:column;gap:6px;max-height:200px;overflow:auto}
+#hdr-plugin-panel .canvas-item{display:flex;gap:8px;align-items:center;padding:6px;border:1px solid #232936;border-radius:6px;background:#0e1117;cursor:pointer}
+#hdr-plugin-panel .canvas-item.selected{border-color:#7fd4ff}
+#hdr-plugin-panel .canvas-item img{width:48px;height:32px;object-fit:cover;background:#000;border-radius:4px}
+#hdr-per-canvas-root{position:fixed;inset:0;pointer-events:none;z-index:99997}
+.hdr-per-canvas-btn{position:absolute;pointer-events:auto;background:rgba(11,13,18,0.85);color:#dfe6f0;border:1px solid #7fd4ff;border-radius:8px;padding:4px 8px;font:11px system-ui;cursor:pointer;backdrop-filter:blur(6px);transform:translate(0,0)}
+.hdr-per-canvas-btn:hover{background:rgba(20,30,50,0.95);border-color:#ffd479}
+`;
+		document.head.appendChild(style);
+	}
+
 	function createUI() {
 		injectCSS();
 		if (uiRoot) return;
@@ -459,7 +497,7 @@ fn weight() -> f32 {
 		var btn = document.createElement('button');
 		btn.id = 'hdr-capture-btn';
 		btn.textContent = 'HDR 📸';
-		btn.title = 'HDR gainmap capture';
+		btn.title = 'HDR gainmap capture — click to list canvases';
 		uiRoot.appendChild(btn);
 		panel = document.createElement('div');
 		panel.id = 'hdr-plugin-panel';
@@ -482,6 +520,9 @@ fn weight() -> f32 {
 </div>
 `;
 		uiRoot.appendChild(panel);
+		perCanvasRoot = document.createElement('div');
+		perCanvasRoot.id = 'hdr-per-canvas-root';
+		document.body.appendChild(perCanvasRoot);
 		listEl = panel.querySelector('#hdr-canvas-list');
 		editorEl = panel.querySelector('#hdr-editor');
 		canvasEl = panel.querySelector('#hdr-preview');
@@ -495,22 +536,95 @@ fn weight() -> f32 {
 		panel.querySelector('#hdr-export').addEventListener('click', exportPair);
 	}
 
+	function updatePerCanvasButtons() {
+		if (!perCanvasRoot) return;
+		if (!optsGlobal.perCanvasButton) { perCanvasRoot.innerHTML = ''; return; }
+		// throttle: only if panel hidden or not, we show small buttons near each canvas
+		perCanvasRoot.innerHTML = '';
+		perCanvasButtons = [];
+		for (var i = 0; i < canvases.length; i++) {
+			var entry = canvases[i];
+			var c = entry.el;
+			if (!c || !c.getBoundingClientRect) continue;
+			var rect = c.getBoundingClientRect();
+			if (rect.width < 32 || rect.height < 32) continue;
+			if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) continue;
+			var btn = document.createElement('button');
+			btn.className = 'hdr-per-canvas-btn';
+			btn.textContent = entry.type === 'webgpu-hdr' ? 'HDR ⬇' : 'SDR→HDR';
+			btn.title = c.id ? c.id + ' — ' + entry.type : entry.type;
+			// position top-right inside canvas
+			var left = Math.max(4, rect.right - 88);
+			var top = Math.max(4, rect.top + 8);
+			// if canvas is fullscreen fixed, keep near top-right of viewport but offset
+			if (rect.width > window.innerWidth * 0.9 && rect.height > window.innerHeight * 0.9) {
+				left = window.innerWidth - 100;
+				top = 70 + i * 32;
+			}
+			btn.style.left = left + 'px';
+			btn.style.top = top + 'px';
+			(function (canvas, type) {
+				btn.addEventListener('click', function (e) {
+					e.stopPropagation();
+					if (type === 'webgpu-hdr') captureHDR(canvas);
+					else captureSDR(canvas);
+					panel.classList.remove('hidden');
+				});
+			})(c, entry.type);
+			perCanvasRoot.appendChild(btn);
+			perCanvasButtons.push(btn);
+		}
+	}
+
+	var refreshGuard = false;
+	var refreshPending = false;
 	function refreshList() {
 		if (!listEl) return;
-		listEl.innerHTML = '';
+		if (refreshGuard) { refreshPending = true; return; }
+		refreshGuard = true;
+		try {
 		var all = document.querySelectorAll('canvas');
+		var filtered = [];
+		for (var ii = 0; ii < all.length; ii++) {
+			var cc = all[ii];
+			if (cc.width === 0 || cc.height === 0) continue;
+			if (cc.id && cc.id.indexOf('hdr-') === 0) continue;
+			if (cc.closest && (cc.closest('#hdr-plugin-panel') || cc.closest('#hdr-capture-btn'))) continue;
+			filtered.push(cc);
+		}
+		// update canvases array always (for per-canvas buttons) — avoid creating new contexts
 		canvases = [];
-		for (var i = 0; i < all.length; i++) {
-			var c = all[i];
-			if (c.width === 0 || c.height === 0) continue;
+		for (var fi = 0; fi < filtered.length; fi++) {
+			var f = filtered[fi];
+			var inf = webgpuMap.get(f);
+			var tp = inf ? (inf.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr') : 'sdr';
+			try {
+				if (!inf) {
+					// only check 2d if it already exists — calling getContext('2d') is safe (returns existing or creates, but 2d creation is cheap)
+					// for webgl we avoid creation; assume sdr
+					var c2d = f.getContext('2d');
+					if (c2d) tp = '2d';
+				}
+			} catch (e) {}
+			canvases.push({ el: f, type: tp, info: inf });
+		}
+		try { updatePerCanvasButtons(); } catch (e) {}
+		if (panel && panel.classList.contains('hidden')) {
+			return;
+		}
+		listEl.innerHTML = '';
+		for (var i = 0; i < filtered.length; i++) {
+			var c = filtered[i];
 			var info = webgpuMap.get(c);
-			var type = info ? (info.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr') : (c.getContext('2d') ? '2d' : 'unknown');
-			// try to detect HDR via format
-			canvases.push({ el: c, type: type, info: info });
+			var type = info ? (info.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr') : 'sdr';
+			try { if (!info && c.getContext('2d')) type = '2d'; } catch (e) {}
 			var item = document.createElement('div');
 			item.className = 'canvas-item' + (selected && selected.el === c ? ' selected' : '');
 			var thumb = document.createElement('canvas'); thumb.width = 48; thumb.height = 32;
-			try { thumb.getContext('2d').drawImage(c, 0, 0, 48, 32); } catch (e) {}
+			// avoid drawImage from HDR WebGPU canvas (may stall) — use placeholder
+			if (type !== 'webgpu-hdr') {
+				try { thumb.getContext('2d').drawImage(c, 0, 0, 48, 32); } catch (e) {}
+			}
 			item.appendChild(thumb);
 			var meta = document.createElement('div');
 			meta.innerHTML = '<div style="font-weight:600">' + (c.id || 'canvas ' + i) + '</div><div style="color:#8b95a6">' + c.width + '×' + c.height + ' · ' + type + '</div>';
@@ -528,6 +642,10 @@ fn weight() -> f32 {
 			listEl.appendChild(item);
 		}
 		if (canvases.length === 0) listEl.textContent = 'No canvases found';
+		} finally {
+			refreshGuard = false;
+			if (refreshPending) { refreshPending = false; setTimeout(refreshList, 50); }
+		}
 	}
 
 	function setStatus(t) { if (statusEl) statusEl.textContent = t; }
@@ -964,14 +1082,35 @@ fn weight() -> f32 {
 	// ── public API ─────────────────────────────────────────────────────────
 	function init(opts) {
 		opts = opts || {};
+		optsGlobal = { perCanvasButton: opts.perCanvasButton !== false, autoScan: opts.autoScan !== false };
 		ensurePatch();
 		createUI();
-		if (opts.autoScan !== false) {
-			setInterval(refreshList, 1000);
-			var observer = new MutationObserver(function () { refreshList(); });
-			observer.observe(document.body, { childList: true, subtree: true });
+		if (optsGlobal.autoScan) {
+			setInterval(refreshList, 2000);
+			var observer = new MutationObserver(function (mutations) {
+				for (var i = 0; i < mutations.length; i++) {
+					var m = mutations[i];
+					if (m.target && m.target.closest) {
+						if (m.target.closest('#hdr-plugin-panel') || m.target.closest('#hdr-capture-btn') || m.target.closest('#hdr-per-canvas-root')) continue;
+					}
+					var skip = false;
+					if (m.addedNodes) {
+						for (var j = 0; j < m.addedNodes.length; j++) {
+							var n = m.addedNodes[j];
+							if (n.nodeType === 1 && (n.id === 'hdr-plugin-panel' || n.id === 'hdr-capture-btn' || n.id === 'hdr-per-canvas-root' || (n.closest && (n.closest('#hdr-plugin-panel') || n.closest('#hdr-capture-btn') || n.closest('#hdr-per-canvas-root'))))) { skip = true; break; }
+						}
+					}
+					if (skip) continue;
+					if (!refreshGuard) setTimeout(refreshList, 200);
+					break;
+				}
+			});
+			try { observer.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+			window.addEventListener('scroll', function () { if (optsGlobal.perCanvasButton) updatePerCanvasButtons(); }, { passive: true });
+			window.addEventListener('resize', function () { if (optsGlobal.perCanvasButton) updatePerCanvasButtons(); });
 		}
-		refreshList();
+		setTimeout(refreshList, 500);
+		setTimeout(function () { if (optsGlobal.perCanvasButton) updatePerCanvasButtons(); }, 1000);
 	}
 
 	var api = { init: init, captureSDR: captureSDR, captureHDR: captureHDR, requestHDRReadback: requestHDRReadback, buildUltraHDR: buildUltraHDR, _webgpuMap: webgpuMap };

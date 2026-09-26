@@ -4,40 +4,43 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Galaxy Demo + HDR Capture Plugin</title>
+<script src="../hdr-gainmap-plugin.js"></script>
 <style>
-	body{margin:0;background:#000;color:#fff;font:12px system-ui}
+	body{margin:0;background:#000;color:#fff;font:12px system-ui;overflow:hidden}
 	#info{position:fixed;top:10px;left:10px;z-index:10;background:rgba(20,10,35,0.6);backdrop-filter:blur(10px);padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);max-width:320px}
 	#info h2{margin:0 0 6px;font-size:14px}
 	#info p{margin:0;color:#8a7da5;line-height:1.5}
+	#info a{color:#6bd5ff}
+	#sky{position:fixed;inset:0;width:100%;height:100%;display:block}
 </style>
 </head>
 <body>
 <div id="info">
 	<h2>Galaxy + HDR Plugin</h2>
-	<p>This is a minimal galaxy-like HDR demo to show plugin usage.<br>
-	Original galaxy demo: <a href="https://github.com/luncat8/galaxy-star-movement-demo/blob/main/simple/simple-friction-field-webGPU.html" style="color:#6bd5ff">github link</a><br>
-	To use plugin with original: add<br>
+	<p>Mini galaxy HDR demo (simplified). Original: <a href="https://github.com/luncat8/galaxy-star-movement-demo/blob/main/simple/simple-friction-field-webGPU.html" target="_blank">github</a><br>
+	To use with original: add<br>
 	<code>&lt;script src="../hdr-gainmap-plugin.js"&gt;&lt;/script&gt;</code><br>
-	before &lt;/body&gt;.<br><br>
-	Plugin adds <b>HDR 📸</b> button. Click → HDR→Save to capture current HDR frame as Ultra HDR JPEG.
+	in &lt;head&gt; before WebGPU code.<br><br>
+	Plugin adds <b>HDR 📸</b> button. Click → HDR→Save to capture HDR frame as Ultra HDR JPEG.<br>
+	Drag to rotate, scroll to zoom.
 	</p>
 </div>
-<canvas id="sky" style="position:fixed;inset:0;width:100%;height:100%"></canvas>
+<canvas id="sky"></canvas>
 
 <script>
 'use strict';
 const TAU = Math.PI*2;
 const canvas = document.getElementById('sky');
-const N_DISK = 8000, N_BULGE = 1500;
+const N_DISK = 6000, N_BULGE = 1000;
 const CAM_DIST = 12.0, V0=1.8, SCENE_GAIN=1.5;
-let speed=1.0, damping=0.7, ecc_max=0.2, Omega_p=0.15, pitch_deg=15, num_arms=2, pattern_phase=0;
+let speed=1.0, ecc_max=0.2, Omega_p=0.15, pitch_deg=15, num_arms=2, pattern_phase=0;
 let rotZ=0, tilt=1.2, zoom=1, tRotZ=0, tTilt=1.2, tZoom=1;
-let exposure=0, saturation=1, hdrHeadroom=4, showField=false, armTint=true, showTrails=false;
+let exposure=0, saturation=1, hdrHeadroom=4;
 let device, context, diskPipeline, bulgePipeline, bgPipeline, presentPipeline;
 let diskThetaBuffer, diskStaticBuffer, bulgeThetaBuffer, bulgeStaticBuffer;
 let diskCamBuffer, bulgeCamBuffer, bgUniformBuffer, presentUniformBuffer;
 let texSampler, fboTex=[null,null], fboViews=[null,null], bgBindGroups=[null,null], presentBindGroups=[null,null];
-let cur=0, W=0,H=0,DPR=1,fw=0,fh=0, gpuLost=false;
+let cur=0, W=0,H=0,DPR=1,fw=0,fh=0;
 const diskCamData=new Float32Array(16), bulgeCamData=new Float32Array(16), bgUniformData=new Float32Array(8), presentUniformData=new Float32Array(4);
 const r_arr=new Float32Array(N_DISK), theta_arr=new Float32Array(N_DISK), brightness_arr=new Float32Array(N_DISK), ecc_u_arr=new Float32Array(N_DISK), peri_arr=new Float32Array(N_DISK);
 const bulge_r=new Float32Array(N_BULGE), bulge_theta=new Float32Array(N_BULGE);
@@ -103,7 +106,9 @@ async function initWebGPU(){
 	device=await adapter.requestDevice();
 	context=canvas.getContext('webgpu');
 	var format='rgba16float';
-	context.configure({ device, format, colorSpace:'srgb', toneMapping:{mode:'extended'}, alphaMode:'opaque' });
+	try {
+		context.configure({ device, format, colorSpace:'srgb', toneMapping:{mode:'extended'}, alphaMode:'opaque' });
+	} catch(e){ context.configure({ device, format, colorSpace:'srgb', alphaMode:'opaque' }); }
 	var diskModule=device.createShaderModule({code:WGSL_DISK});
 	var bulgeModule=device.createShaderModule({code:WGSL_BULGE});
 	var bgModule=device.createShaderModule({code:WGSL_BG});
@@ -124,15 +129,15 @@ async function initWebGPU(){
 	bulgePipeline=device.createRenderPipeline({layout:'auto', vertex:{module:bulgeModule, entryPoint:'vs_bulge', buffers:[{arrayStride:4, stepMode:'instance', attributes:[{shaderLocation:0,offset:0,format:'float32'}]}, {arrayStride:20, stepMode:'instance', attributes:[{shaderLocation:1,offset:0,format:'float32x3'},{shaderLocation:2,offset:12,format:'float32x2'}]}]}, fragment:{module:bulgeModule, entryPoint:'fs_point', targets:[{format:'rgba16float', blend:additiveBlend}]}, primitive:{topology:'triangle-list'}});
 	bgPipeline=device.createRenderPipeline({layout:'auto', vertex:{module:bgModule, entryPoint:'vs_quad'}, fragment:{module:bgModule, entryPoint:'fs_bg', targets:[{format:'rgba16float'}]}, primitive:{topology:'triangle-list'}});
 	presentPipeline=device.createRenderPipeline({layout:'auto', vertex:{module:presentModule, entryPoint:'vs_quad'}, fragment:{module:presentModule, entryPoint:'fs_present', targets:[{format:'rgba16float'}]}, primitive:{topology:'triangle-list'}});
-	var diskBG=device.createBindGroup({layout:diskPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:diskCamBuffer}}]});
-	var bulgeBG=device.createBindGroup({layout:bulgePipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:bulgeCamBuffer}}]});
-	window._diskBG=diskBG; window._bulgeBG=bulgeBG;
+	window._diskBG=device.createBindGroup({layout:diskPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:diskCamBuffer}}]});
+	window._bulgeBG=device.createBindGroup({layout:bulgePipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:bulgeCamBuffer}}]});
 	resize(); return true;
 }
 function createTargets(){
 	if(!device) return;
 	for(let i=0;i<2;i++){ if(fboTex[i]) fboTex[i].destroy(); }
 	fw=canvas.width; fh=canvas.height;
+	if(fw===0||fh===0) return;
 	for(let i=0;i<2;i++){ fboTex[i]=device.createTexture({size:[fw,fh], format:'rgba16float', usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}); fboViews[i]=fboTex[i].createView(); }
 	for(let i=0;i<2;i++){
 		bgBindGroups[i]=device.createBindGroup({layout:bgPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:bgUniformBuffer}},{binding:1,resource:fboViews[1-i]},{binding:2,resource:texSampler}]});
@@ -142,6 +147,7 @@ function createTargets(){
 }
 function resize(){
 	DPR=Math.min(window.devicePixelRatio||1,2); W=innerWidth; H=innerHeight;
+	if(W===0||H===0) return;
 	canvas.width=Math.max(1,Math.round(W*DPR)); canvas.height=Math.max(1,Math.round(H*DPR));
 	canvas.style.width=W+'px'; canvas.style.height=H+'px';
 	createTargets();
@@ -154,23 +160,25 @@ function update(dt){
 function render(simDt){
 	if(simDt>0){ update(simDt); device.queue.writeBuffer(diskThetaBuffer,0,theta_arr); device.queue.writeBuffer(bulgeThetaBuffer,0,bulge_theta); }
 	var tan_pitch=Math.tan(pitch_deg*Math.PI/180); var scalePx=Math.min(W,H)/14*zoom*DPR; var cosR=Math.cos(rotZ), sinR=Math.sin(rotZ), cosT=Math.cos(tilt), sinT=Math.sin(tilt);
-	diskCamData[0]=cosR; diskCamData[1]=sinR; diskCamData[2]=cosT; diskCamData[3]=sinT; diskCamData[4]=scalePx; diskCamData[5]=fw*0.5; diskCamData[6]=fh*0.5; diskCamData[7]=CAM_DIST; diskCamData[8]=tan_pitch; diskCamData[9]=pattern_phase; diskCamData[10]=TAU/num_arms; diskCamData[11]=1/0.125; diskCamData[12]=ecc_max; diskCamData[13]=8*DPR; diskCamData[14]=armTint?1:0; diskCamData[15]=0;
+	diskCamData[0]=cosR; diskCamData[1]=sinR; diskCamData[2]=cosT; diskCamData[3]=sinT; diskCamData[4]=scalePx; diskCamData[5]=fw*0.5; diskCamData[6]=fh*0.5; diskCamData[7]=CAM_DIST; diskCamData[8]=tan_pitch; diskCamData[9]=pattern_phase; diskCamData[10]=TAU/num_arms; diskCamData[11]=1/0.125; diskCamData[12]=ecc_max; diskCamData[13]=8*DPR; diskCamData[14]=1; diskCamData[15]=0;
 	device.queue.writeBuffer(diskCamBuffer,0,diskCamData);
 	for(let i=0;i<16;i++) bulgeCamData[i]=diskCamData[i]; bulgeCamData[13]=6*DPR; device.queue.writeBuffer(bulgeCamBuffer,0,bulgeCamData);
-	bgUniformData[0]=fw; bgUniformData[1]=fh; bgUniformData[2]=Math.min(W,H)*0.15*zoom*DPR; bgUniformData[3]=showTrails?1:0; bgUniformData[4]=0.85; device.queue.writeBuffer(bgUniformBuffer,0,bgUniformData);
+	bgUniformData[0]=fw; bgUniformData[1]=fh; bgUniformData[2]=Math.min(W,H)*0.15*zoom*DPR; bgUniformData[3]=0; bgUniformData[4]=0.85; device.queue.writeBuffer(bgUniformBuffer,0,bgUniformData);
 	presentUniformData[0]=SCENE_GAIN*Math.pow(2,exposure); presentUniformData[1]=saturation; presentUniformData[2]=hdrHeadroom; presentUniformData[3]=0; device.queue.writeBuffer(presentUniformBuffer,0,presentUniformData);
-	var encoder=device.createCommandEncoder();
-	var scenePassDesc={colorAttachments:[{view:fboViews[cur], loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
-	var pass1=encoder.beginRenderPass(scenePassDesc);
-	pass1.setPipeline(bgPipeline); pass1.setBindGroup(0,bgBindGroups[cur]); pass1.draw(3);
-	pass1.setPipeline(bulgePipeline); pass1.setBindGroup(0,window._bulgeBG); pass1.setVertexBuffer(0,bulgeThetaBuffer); pass1.setVertexBuffer(1,bulgeStaticBuffer); pass1.draw(6,N_BULGE);
-	pass1.setPipeline(diskPipeline); pass1.setBindGroup(0,window._diskBG); pass1.setVertexBuffer(0,diskThetaBuffer); pass1.setVertexBuffer(1,diskStaticBuffer); pass1.draw(6,N_DISK);
-	pass1.end();
-	var presentPassDesc={colorAttachments:[{view:context.getCurrentTexture().createView(), loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
-	var pass2=encoder.beginRenderPass(presentPassDesc);
-	pass2.setPipeline(presentPipeline); pass2.setBindGroup(0,presentBindGroups[cur]); pass2.draw(3); pass2.end();
-	device.queue.submit([encoder.finish()]);
-	cur=1-cur;
+	try {
+		var encoder=device.createCommandEncoder();
+		var scenePassDesc={colorAttachments:[{view:fboViews[cur], loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
+		var pass1=encoder.beginRenderPass(scenePassDesc);
+		pass1.setPipeline(bgPipeline); pass1.setBindGroup(0,bgBindGroups[cur]); pass1.draw(3);
+		pass1.setPipeline(bulgePipeline); pass1.setBindGroup(0,window._bulgeBG); pass1.setVertexBuffer(0,bulgeThetaBuffer); pass1.setVertexBuffer(1,bulgeStaticBuffer); pass1.draw(6,N_BULGE);
+		pass1.setPipeline(diskPipeline); pass1.setBindGroup(0,window._diskBG); pass1.setVertexBuffer(0,diskThetaBuffer); pass1.setVertexBuffer(1,diskStaticBuffer); pass1.draw(6,N_DISK);
+		pass1.end();
+		var presentPassDesc={colorAttachments:[{view:context.getCurrentTexture().createView(), loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
+		var pass2=encoder.beginRenderPass(presentPassDesc);
+		pass2.setPipeline(presentPipeline); pass2.setBindGroup(0,presentBindGroups[cur]); pass2.draw(3); pass2.end();
+		device.queue.submit([encoder.finish()]);
+		cur=1-cur;
+	} catch(e){ console.error('render error', e); }
 }
 var isDragging=false,lastX=0,lastY=0;
 canvas.addEventListener('pointerdown',e=>{isDragging=true;lastX=e.clientX;lastY=e.clientY;});
@@ -180,12 +188,10 @@ canvas.addEventListener('wheel',e=>{e.preventDefault();tZoom*=e.deltaY>0?0.92:1.
 let lastTime=performance.now();
 function loop(now){
 	var dt=Math.min(0.05,(now-lastTime)/1000); lastTime=now;
-	if(device){ rotZ+=(tRotZ-rotZ)*0.1; tilt+=(tTilt-tilt)*0.1; zoom+=(tZoom-zoom)*0.1; pattern_phase+=Omega_p*dt*speed*0.5; render(dt); }
+	if(device){ rotZ+=(tRotZ-rotZ)*0.1; tilt+=(tTilt-tilt)*0.1; zoom+=(tZoom-zoom)*0.1; pattern_phase+=Omega_p*dt*speed*0.5; if(fw>0&&fh>0) render(dt); }
 	requestAnimationFrame(loop);
 }
 initWebGPU().then(ok=>{if(ok) requestAnimationFrame(loop);});
 </script>
-
-<script src="../hdr-gainmap-plugin.js"></script>
 </body>
 </html>

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SDR Canvas → HDR — plugin demo</title>
+<script src="../hdr-gainmap-plugin.js"></script>
 <style>
 	:root{color-scheme:dark;font:14px system-ui,sans-serif}
 	body{margin:0;padding:20px;background:#0b0d12;color:#dfe6f0}
@@ -22,7 +23,7 @@
 <div id="info">
 	This is a plain 2D canvas (SDR). The plugin auto-detects it and adds <b>HDR 📸</b> button at bottom-right.<br>
 	Click <b>HDR 📸</b> → canvas list → <b>SDR→HDR</b> to author a gain map with curve editor and save as Ultra HDR JPEG.<br>
-	No changes to this page's code were needed except adding <code>&lt;script src="../hdr-gainmap-plugin.js"&gt;&lt;/script&gt;</code>.
+	Plugin is loaded in &lt;head&gt; so it patches getContext early.
 </div>
 
 <script>
@@ -53,7 +54,5 @@ c.addEventListener('pointermove',function(e){
 	ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.beginPath(); ctx.arc(x,y,6,0,Math.PI*2); ctx.fill();
 });
 </script>
-
-<script src="../hdr-gainmap-plugin.js"></script>
 </body>
 </html>
