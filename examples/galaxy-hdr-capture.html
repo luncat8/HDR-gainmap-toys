@@ -106,9 +106,10 @@ async function initWebGPU(){
 	device=await adapter.requestDevice();
 	context=canvas.getContext('webgpu');
 	var format='rgba16float';
+	var canvasUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING;
 	try {
-		context.configure({ device, format, colorSpace:'srgb', toneMapping:{mode:'extended'}, alphaMode:'opaque' });
-	} catch(e){ context.configure({ device, format, colorSpace:'srgb', alphaMode:'opaque' }); }
+		context.configure({ device, format, colorSpace:'srgb', toneMapping:{mode:'extended'}, alphaMode:'opaque', usage: canvasUsage });
+	} catch(e){ context.configure({ device, format, colorSpace:'srgb', alphaMode:'opaque', usage: canvasUsage }); }
 	var diskModule=device.createShaderModule({code:WGSL_DISK});
 	var bulgeModule=device.createShaderModule({code:WGSL_BULGE});
 	var bgModule=device.createShaderModule({code:WGSL_BG});

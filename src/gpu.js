@@ -18,7 +18,8 @@
 			format: HDRTEX,
 			colorSpace: 'srgb',
 			toneMapping: { mode: 'extended' },
-			alphaMode: 'opaque'
+			alphaMode: 'opaque',
+			usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING
 		});
 		var config = context.getConfiguration();
 		return {

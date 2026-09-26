@@ -111,6 +111,7 @@ context.configure({
 		mode: "extended",
 	},
 	alphaMode: "opaque",
+	usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
 });
 
 const shader = device.createShaderModule({

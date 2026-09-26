@@ -144,6 +144,7 @@
 			origGetContext = HTMLCanvasElement.prototype.getContext;
 			HTMLCanvasElement.prototype.getContext = function (type, opts) {
 				var ctx = origGetContext.call(this, type, opts);
+				try { this._hdrCtxType = type; } catch (e) {}
 				if (type === 'webgpu' && ctx) {
 					wrapContext(this, ctx);
 				}
@@ -159,7 +160,19 @@
 		ctx._hdrPatched = true;
 		var origConfigure = ctx.configure.bind(ctx);
 		ctx.configure = function (config) {
-			var info = webgpuMap.get(canvas);
+			// readback needs COPY_SRC on the swapchain texture. Default configure
+			// usage is RENDER_ATTACHMENT only, so copyTextureToBuffer would fail
+			// with "usage doesn't include CopySrc". OR the flag in silently.
+			try {
+				if (typeof GPUTextureUsage !== 'undefined') {
+					var need = GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING;
+					if (typeof config.usage === 'number') config.usage = config.usage | need;
+					else config.usage = GPUTextureUsage.RENDER_ATTACHMENT | need;
+				}
+			} catch (e) {}
+			var prev = webgpuMap.get(canvas);
+			var prevDevice = prev ? prev.device : null;
+			var info = prev;
 			if (!info) {
 				info = { canvas: canvas, context: ctx, device: config.device, format: config.format, lastTexture: null, width: 0, height: 0, pending: null, colorSpace: config.colorSpace, toneMapping: config.toneMapping };
 				webgpuMap.set(canvas, info);
@@ -167,6 +180,10 @@
 				info.device = config.device;
 				info.format = config.format;
 				info.context = ctx;
+			}
+			if (prevDevice && prevDevice !== config.device) {
+				var oldSet = deviceMap.get(prevDevice);
+				if (oldSet) oldSet.delete(canvas);
 			}
 			var set = deviceMap.get(config.device);
 			if (!set) { set = new Set(); deviceMap.set(config.device, set); }
@@ -187,6 +204,13 @@
 		};
 	}
 
+	function formatBpp(fmt) {
+		if (!fmt) return 8;
+		if (fmt.indexOf('32float') >= 0) return 16;
+		if (fmt.indexOf('16float') >= 0) return 8;
+		return 4;
+	}
+
 	function patchDevice(device) {
 		if (!device || device._hdrQueuePatched) return;
 		device._hdrQueuePatched = true;
@@ -202,40 +226,56 @@
 			}
 			if (pendingList.length) {
 				var copyEnc = device.createCommandEncoder();
+				var okList = [], failList = [];
 				for (var i = 0; i < pendingList.length; i++) {
 					var info = pendingList[i];
 					var w = info.width, h = info.height;
-					if (w <= 0 || h <= 0) continue;
-					var bpp = 8;
+					if (w <= 0 || h <= 0) { failList.push([info, new Error('canvas has no size yet')]); continue; }
+					var bpp = formatBpp(info.format);
 					var row = w * bpp;
 					var padded = Math.ceil(row / 256) * 256;
-					var buf = device.createBuffer({ size: padded * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-					copyEnc.copyTextureToBuffer({ texture: info.lastTexture }, { buffer: buf, bytesPerRow: padded, rowsPerImage: h }, { width: w, height: h });
+					var buf;
+					try {
+						buf = device.createBuffer({ size: padded * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+					} catch (e) { failList.push([info, e]); continue; }
+					try {
+						copyEnc.copyTextureToBuffer({ texture: info.lastTexture }, { buffer: buf, bytesPerRow: padded, rowsPerImage: h }, { width: w, height: h });
+					} catch (e) {
+						try { buf.destroy(); } catch (e2) {}
+						failList.push([info, new Error('swapchain copy failed (' + e.message + ') — canvas was configured before the plugin patched it? reload with the plugin script in <head>')]);
+						continue;
+					}
 					info.pending.buffer = buf;
 					info.pending.bytesPerRow = padded;
 					info.pending.width = w;
 					info.pending.height = h;
+					info.pending.format = info.format;
 					info.pending._info = info;
+					okList.push(info);
 				}
+				for (var f = 0; f < failList.length; f++) {
+					var fi = failList[f][0], fe = failList[f][1];
+					var fp = fi.pending; fi.pending = null;
+					if (fp && fp.reject) fp.reject(fe);
+				}
+				if (!okList.length) return origSubmit(commandBuffers);
 				var copyCB = copyEnc.finish();
 				var all = [];
 				for (var j = 0; j < commandBuffers.length; j++) all.push(commandBuffers[j]);
 				all.push(copyCB);
 				var res = origSubmit(all);
-				// async resolve after submit
-				for (var k = 0; k < pendingList.length; k++) {
+				for (var k = 0; k < okList.length; k++) {
 					(function (info) {
 						var p = info.pending;
 						if (!p) return;
 						info.pending = null;
-						// map async
 						p.buffer.mapAsync(GPUMapMode.READ).then(function () {
 							var raw = new Uint8Array(p.buffer.getMappedRange().slice(0));
 							p.buffer.unmap(); p.buffer.destroy();
-							var out = decodeHalfBuffer(raw, p.width, p.height, p.bytesPerRow);
+							var out = decodeReadback(raw, p.width, p.height, p.bytesPerRow, p.format);
 							if (p.resolve) p.resolve(out);
 						}).catch(function (e) { if (p.reject) p.reject(e); });
-					})(pendingList[k]);
+					})(okList[k]);
 				}
 				return res;
 			}
@@ -244,24 +284,49 @@
 	}
 
 	function decodeHalfBuffer(raw, w, h, padded) {
-		var bpp = 8;
+		return decodeReadback(raw, w, h, padded, 'rgba16float');
+	}
+
+	function decodeReadback(raw, w, h, padded, format) {
+		var bpp = formatBpp(format);
 		var rowBytes = w * bpp;
-		var u16;
 		var out = new Float32Array(w * h * 4);
-		if (padded === rowBytes) {
-			u16 = new Uint16Array(raw.buffer, raw.byteOffset, w * h * 4);
-			for (var i = 0; i < out.length; i++) out[i] = halfToFloat(u16[i]);
-		} else {
-			u16 = new Uint16Array(w * h * 4);
-			var idx = 0;
-			for (var y = 0; y < h; y++) {
-				var rowStart = y * padded;
-				var rowU16 = new Uint16Array(raw.buffer, raw.byteOffset + rowStart, w * 4);
-				for (var x = 0; x < w * 4; x++) u16[idx++] = rowU16[x];
+		var y, x, i;
+		if (bpp === 8) {
+			if (padded === rowBytes) {
+				var u16 = new Uint16Array(raw.buffer, raw.byteOffset, w * h * 4);
+				for (i = 0; i < out.length; i++) out[i] = halfToFloat(u16[i]);
+			} else {
+				var idx = 0;
+				for (y = 0; y < h; y++) {
+					var rowU16 = new Uint16Array(raw.buffer, raw.byteOffset + y * padded, w * 4);
+					for (x = 0; x < w * 4; x++) out[idx++] = halfToFloat(rowU16[x]);
+				}
 			}
-			for (var j = 0; j < out.length; j++) out[j] = halfToFloat(u16[j]);
+		} else if (bpp === 16) {
+			if (padded === rowBytes) {
+				out.set(new Float32Array(raw.buffer, raw.byteOffset, w * h * 4));
+			} else {
+				var o = 0;
+				for (y = 0; y < h; y++) {
+					var rowF32 = new Float32Array(raw.buffer, raw.byteOffset + y * padded, w * 4);
+					for (x = 0; x < w * 4; x++) out[o++] = rowF32[x];
+				}
+			}
+		} else {
+			var bgra = format && format.indexOf('bgra') === 0;
+			var o2 = 0;
+			for (y = 0; y < h; y++) {
+				var off = y * padded;
+				for (x = 0; x < w; x++) {
+					var r = raw[off], g = raw[off + 1], b = raw[off + 2], a = raw[off + 3];
+					off += 4;
+					if (bgra) { var t = r; r = b; b = t; }
+					out[o2++] = r / 255; out[o2++] = g / 255; out[o2++] = b / 255; out[o2++] = a / 255;
+				}
+			}
 		}
-		return { data: out, width: w, height: h };
+		return { data: out, width: w, height: h, format: format };
 	}
 
 	function requestHDRReadback(canvas) {
@@ -431,32 +496,6 @@ fn weight() -> f32 {
 	var histTex = null, canvasEl = null, histEl = null, curveCanvas = null, statusEl = null;
 	var curveEditor = null;
 
-	function injectCSS() {
-		if (document.getElementById('hdr-plugin-style')) return;
-		var style = document.createElement('style');
-		style.id = 'hdr-plugin-style';
-		style.textContent = `
-#hdr-capture-btn{position:fixed;right:18px;bottom:18px;z-index:99999;background:#0b0d12;color:#dfe6f0;border:1px solid #232936;border-radius:10px;padding:10px 14px;font:13px system-ui;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,0.5)}
-#hdr-capture-btn:hover{border-color:#7fd4ff}
-#hdr-plugin-panel{position:fixed;right:18px;bottom:62px;z-index:99999;width:380px;max-height:85vh;overflow:auto;background:#14171f;color:#dfe6f0;border:1px solid #232936;border-radius:12px;padding:12px;font:12px system-ui;box-shadow:0 20px 60px rgba(0,0,0,0.6)}
-#hdr-plugin-panel.hidden{display:none}
-#hdr-plugin-panel h3{margin:8px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:#8b95a6}
-#hdr-plugin-panel .row{display:grid;grid-template-columns:96px 1fr 60px;gap:6px;align-items:center;padding:3px 0}
-#hdr-plugin-panel .row .label{color:#8b95a6}
-#hdr-plugin-panel .row .value{text-align:right;font-variant-numeric:tabular-nums}
-#hdr-plugin-panel input[type=range]{width:100%;accent-color:#7fd4ff}
-#hdr-plugin-panel button{background:#1b202b;color:#dfe6f0;border:1px solid #232936;border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer;margin:2px}
-#hdr-plugin-panel button:hover{border-color:#7fd4ff}
-#hdr-plugin-panel canvas{width:100%;border:1px solid #232936;border-radius:6px;background:#0e1117}
-#hdr-plugin-panel .canvas-list{display:flex;flex-direction:column;gap:6px;max-height:200px;overflow:auto}
-#hdr-plugin-panel .canvas-item{display:flex;gap:8px;align-items:center;padding:6px;border:1px solid #232936;border-radius:6px;background:#0e1117;cursor:pointer}
-#hdr-plugin-panel .canvas-item.selected{border-color:#7fd4ff}
-#hdr-plugin-panel .canvas-item img{width:48px;height:32px;object-fit:cover;background:#000;border-radius:4px}
-#hdr-plugin-panel .per-canvas-btn{position:absolute;z-index:99998;background:rgba(11,13,18,0.9);color:#dfe6f0;border:1px solid #7fd4ff;border-radius:6px;padding:4px 8px;font:11px system-ui;cursor:pointer;transform:translate(-50%,-100%);margin-top:-8px}
-`;
-		document.head.appendChild(style);
-	}
-
 	var perCanvasRoot = null;
 	var perCanvasButtons = [];
 	var optsGlobal = { perCanvasButton: true };
@@ -578,6 +617,17 @@ fn weight() -> f32 {
 
 	var refreshGuard = false;
 	var refreshPending = false;
+	function canvasType(c, inf) {
+		if (inf) return inf.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr';
+		try {
+			var t = c._hdrCtxType;
+			if (t === '2d') return '2d';
+			if (t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl') return t;
+			if (t === 'webgpu') return 'webgpu-sdr';
+			if (t === 'bitmaprenderer') return 'bitmaprenderer';
+		} catch (e) {}
+		return 'sdr';
+	}
 	function refreshList() {
 		if (!listEl) return;
 		if (refreshGuard) { refreshPending = true; return; }
@@ -592,21 +642,15 @@ fn weight() -> f32 {
 			if (cc.closest && (cc.closest('#hdr-plugin-panel') || cc.closest('#hdr-capture-btn'))) continue;
 			filtered.push(cc);
 		}
-		// update canvases array always (for per-canvas buttons) — avoid creating new contexts
+		// update canvases array always (for per-canvas buttons). Never call
+		// getContext here: on a canvas with no context yet it would CREATE one
+		// (usually 2d) and steal it from the app's later getContext('webgpu').
+		// The patched getContext records the type in _hdrCtxType instead.
 		canvases = [];
 		for (var fi = 0; fi < filtered.length; fi++) {
 			var f = filtered[fi];
 			var inf = webgpuMap.get(f);
-			var tp = inf ? (inf.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr') : 'sdr';
-			try {
-				if (!inf) {
-					// only check 2d if it already exists — calling getContext('2d') is safe (returns existing or creates, but 2d creation is cheap)
-					// for webgl we avoid creation; assume sdr
-					var c2d = f.getContext('2d');
-					if (c2d) tp = '2d';
-				}
-			} catch (e) {}
-			canvases.push({ el: f, type: tp, info: inf });
+			canvases.push({ el: f, type: canvasType(f, inf), info: inf });
 		}
 		try { updatePerCanvasButtons(); } catch (e) {}
 		if (panel && panel.classList.contains('hidden')) {
@@ -616,13 +660,12 @@ fn weight() -> f32 {
 		for (var i = 0; i < filtered.length; i++) {
 			var c = filtered[i];
 			var info = webgpuMap.get(c);
-			var type = info ? (info.format === 'rgba16float' ? 'webgpu-hdr' : 'webgpu-sdr') : 'sdr';
-			try { if (!info && c.getContext('2d')) type = '2d'; } catch (e) {}
+			var type = canvasType(c, info);
 			var item = document.createElement('div');
 			item.className = 'canvas-item' + (selected && selected.el === c ? ' selected' : '');
 			var thumb = document.createElement('canvas'); thumb.width = 48; thumb.height = 32;
-			// avoid drawImage from HDR WebGPU canvas (may stall) — use placeholder
-			if (type !== 'webgpu-hdr') {
+			// drawImage from a WebGPU swapchain canvas is unreliable — placeholder
+			if (type.indexOf('webgpu') !== 0) {
 				try { thumb.getContext('2d').drawImage(c, 0, 0, 48, 32); } catch (e) {}
 			}
 			item.appendChild(thumb);
@@ -653,7 +696,7 @@ fn weight() -> f32 {
 	// ── capture SDR ────────────────────────────────────────────────────────
 	async function captureSDR(canvas) {
 		try {
-			ensureProcessorUI();
+			await ensureProcessorUI();
 			var bitmap;
 			try { bitmap = await createImageBitmap(canvas); } catch (e) { bitmap = canvas; }
 			state.sourceCanvas = canvas;
@@ -674,7 +717,7 @@ fn weight() -> f32 {
 	// ── capture HDR ────────────────────────────────────────────────────────
 	async function captureHDR(canvas) {
 		try {
-			ensureProcessorUI();
+			await ensureProcessorUI();
 			setStatus('Capturing HDR frame… (next frame)');
 			var data;
 			if (webgpuMap.has(canvas)) {
@@ -729,7 +772,10 @@ fn weight() -> f32 {
 	async function initProcessorForSource(source) {
 		var proc = gpuProc;
 		var device = proc.device;
-		if (srcTex) srcTex.destroy();
+		if (srcTex) { try { srcTex.destroy(); } catch (e) {} srcTex = null; }
+		if (gainTex) { try { gainTex.destroy(); } catch (e) {} gainTex = null; }
+		if (hdrTex) { try { hdrTex.destroy(); } catch (e) {} hdrTex = null; }
+		if (histTex) { try { histTex.destroy(); } catch (e) {} histTex = null; }
 		var gs = gainSize();
 		gainW = gs[0]; gainH = gs[1];
 		srcTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -749,6 +795,7 @@ fn weight() -> f32 {
 		bgGainView = bg(gainTex, gainTex);
 		bgBase = bg(srcTex, srcTex);
 		bgHist = bg(srcTex, hdrTex);
+		sizePreview();
 		// configure preview canvas
 		var ctx = canvasEl.getContext('webgpu');
 		if (!ctx._hdrConfigured) {
@@ -757,12 +804,21 @@ fn weight() -> f32 {
 		}
 	}
 
+	function sizePreview() {
+		if (!canvasEl || !state.srcW || !state.srcH) return;
+		var k = Math.min(1, 640 / state.srcW);
+		canvasEl.width = Math.max(1, Math.round(state.srcW * k));
+		canvasEl.height = Math.max(1, Math.round(state.srcH * k));
+	}
+
 	async function initProcessorForHDR(hdrData) {
 		var proc = gpuProc;
 		var device = proc.device;
-		if (srcTex) srcTex.destroy();
-		if (gainTex) gainTex.destroy();
-		if (hdrTex) hdrTex.destroy();
+		if (srcTex) { try { srcTex.destroy(); } catch (e) {} srcTex = null; }
+		if (gainTex) { try { gainTex.destroy(); } catch (e) {} gainTex = null; }
+		if (hdrTex) { try { hdrTex.destroy(); } catch (e) {} hdrTex = null; }
+		if (histTex) { try { histTex.destroy(); } catch (e) {} histTex = null; }
+		gainW = state.srcW; gainH = state.srcH;
 		srcTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
 		gainTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
 		hdrTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
@@ -786,6 +842,7 @@ fn weight() -> f32 {
 		bgGainView = bg(gainTex, gainTex);
 		bgBase = bg(srcTex, srcTex);
 		bgHist = bg(srcTex, hdrTex);
+		sizePreview();
 		var ctx = canvasEl.getContext('webgpu');
 		if (!ctx._hdrConfigured) {
 			ctx.configure({ device: device, format: 'rgba16float', colorSpace: 'srgb', toneMapping: { mode: 'extended' }, alphaMode: 'opaque' });
@@ -793,15 +850,16 @@ fn weight() -> f32 {
 		}
 	}
 
+	var _f32scratch = new Float32Array(1);
+	var _u32scratch = new Uint32Array(_f32scratch.buffer);
 	function floatToHalfArray(f32) {
 		var out = new Uint16Array(f32.length);
 		for (var i = 0; i < f32.length; i++) out[i] = floatToHalf(f32[i]);
 		return out;
 	}
 	function floatToHalf(v) {
-		// simple conversion, from https://stackoverflow.com/a/6162687
-		var f32 = new Float32Array(1); f32[0] = v;
-		var u32 = new Uint32Array(f32.buffer)[0];
+		_f32scratch[0] = v;
+		var u32 = _u32scratch[0];
 		var sign = (u32 >> 31) & 0x1;
 		var exp = (u32 >> 23) & 0xff;
 		var frac = u32 & 0x7fffff;
