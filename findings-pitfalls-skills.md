@@ -142,3 +142,16 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
 * `/tmp` is wiped between turns; keep only repo files, re-install tools per turn.
 * github raw files: `curl -H "Accept: application/vnd.github.raw"
   https://api.github.com/repos/<repo>/git/blobs/<sha>` (raw host is blocked).
+
+## drop-in hdr capture plugin (0.2)
+
+* goal: `<script src="hdr-gainmap-plugin.js">` works in any canvas app, no build.
+* **WebGPU HDR canvas readback** is the hard part: `getCurrentTexture()` returns a texture that is presented after `queue.submit()`. You cannot `copyTextureToTexture` after submit — it is already invalid. Solution: monkey-patch `HTMLCanvasElement.prototype.getContext` → wrap `configure` (store device) and `getCurrentTexture` (store lastTexture), then patch `device.queue.submit` to inject a `copyTextureToBuffer` into the same submit batch as the app's render. The copy buffer is then `mapAsync`'d and decoded from float16. This is generic and works for galaxy demo (ping-pong FBOs + present pass).
+* detection: scan `document.querySelectorAll('canvas')` every 1s + `MutationObserver`; per-canvas type: check `webgpuMap` for `rgba16float` vs `rgba8unorm`, else try `getContext('2d')`.
+* SDR snapshot: `createImageBitmap(canvas)` → offscreen 2D canvas `getImageData` → `queue.writeTexture` with 256-padded `bytesPerRow`. Avoids color-management surprises (same as `gpu.js`).
+* SDR→HDR authoring reuses 0.1 tone model: curve `Y_sdr → t`, `log2gain = shadowLift + t*(highlightGain-shadowLift)`, `hdr = sdr * exp2(log2gain)`, `recovery = t`. No division by sdr, so no log(0).
+* HDR→HDR “save as is”: HDR linear (after sRGB→linear decode if canvas is extended-sRGB) → exposure → tonemap to SDR via peak-preserving compress `mappedPeak = (peak*H)/sqrt(H*H+peak*peak)` (same as galaxy demo), then `logBoost = log2(luma(HDR)/luma(SDR))`, find min/max, `recovery = (logBoost-min)/(max-min)`. Gain map scale 1/4 by default.
+* half float: `halfToFloat` and `floatToHalf` (simple, no subnormals) — enough for readback; `bytesPerRow` must be 256-aligned for `copyTextureToBuffer`.
+* builder: minimal `buildUltraHDR` from `ultrahdr.js` bundled — byte-identical output verified.
+* UI: injected CSS, floating button `#hdr-capture-btn`, panel `#hdr-plugin-panel` with canvas list (thumbnails via `drawImage`), editor with preview canvas (own WebGPU device, `rgba16float` + extended), curve editor (monotone spline from `curve.js`), sliders, histogram (optional). `file://` friendly.
+* example usage: `examples/sdr-canvas-demo.html` (2D canvas), `examples/hdr-canvas-demo.html` (WebGPU HDR gradient), `examples/galaxy-hdr-capture.html` (mini galaxy + plugin). Real galaxy demo: just add `<script src="../hdr-gainmap-plugin.js"></script>` before `</body>` — no other changes.

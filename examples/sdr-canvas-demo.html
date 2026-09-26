@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDR Canvas → HDR — plugin demo</title>
+<style>
+	:root{color-scheme:dark;font:14px system-ui,sans-serif}
+	body{margin:0;padding:20px;background:#0b0d12;color:#dfe6f0}
+	h1{font-size:18px;margin:0 0 12px}
+	.row{display:flex;gap:16px;flex-wrap:wrap}
+	canvas{border:1px solid #232936;border-radius:8px;background:#000}
+	#src{width:640px;height:360px}
+	#info{color:#8b95a6;font-size:12px;margin-top:8px;max-width:640px;line-height:1.5}
+</style>
+</head>
+<body>
+<h1>SDR Canvas → HDR — drop-in plugin demo</h1>
+<div class="row">
+	<canvas id="src" width="640" height="360"></canvas>
+</div>
+<div id="info">
+	This is a plain 2D canvas (SDR). The plugin auto-detects it and adds <b>HDR 📸</b> button at bottom-right.<br>
+	Click <b>HDR 📸</b> → canvas list → <b>SDR→HDR</b> to author a gain map with curve editor and save as Ultra HDR JPEG.<br>
+	No changes to this page's code were needed except adding <code>&lt;script src="../hdr-gainmap-plugin.js"&gt;&lt;/script&gt;</code>.
+</div>
+
+<script>
+// simple SDR content: gradient + sun + color bars
+var c = document.getElementById('src');
+var ctx = c.getContext('2d');
+function draw() {
+	var w = c.width, h = c.height;
+	var g = ctx.createLinearGradient(0,0,0,h);
+	g.addColorStop(0,'#0a1230'); g.addColorStop(0.55,'#2a4a8f'); g.addColorStop(0.8,'#e2723c'); g.addColorStop(1,'#120a08');
+	ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+	var sun = ctx.createRadialGradient(w*0.7,h*0.35,0,w*0.7,h*0.35,w*0.18);
+	sun.addColorStop(0,'#fff'); sun.addColorStop(0.2,'#fffbe8'); sun.addColorStop(1,'rgba(255,240,200,0)');
+	ctx.fillStyle = sun; ctx.fillRect(0,0,w,h);
+	var bars = ['#ff0000','#00ff00','#0000ff','#ffff00','#00ffff','#ff00ff'];
+	var bh = Math.round(h*0.12);
+	for (var i=0;i<bars.length;i++){ ctx.fillStyle=bars[i]; ctx.fillRect(Math.round(i*w/bars.length), h-bh, Math.round(w/bars.length), bh); }
+	ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.font='14px system-ui'; ctx.fillText('SDR canvas — drag to draw', 12, 24);
+}
+draw();
+var drawing=false;
+c.addEventListener('pointerdown',function(e){drawing=true;});
+c.addEventListener('pointerup',function(){drawing=false;});
+c.addEventListener('pointermove',function(e){
+	if(!drawing) return;
+	var r=c.getBoundingClientRect();
+	var x=(e.clientX-r.left)*c.width/r.width, y=(e.clientY-r.top)*c.height/r.height;
+	ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.beginPath(); ctx.arc(x,y,6,0,Math.PI*2); ctx.fill();
+});
+</script>
+
+<script src="../hdr-gainmap-plugin.js"></script>
+</body>
+</html>

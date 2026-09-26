@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Galaxy Demo + HDR Capture Plugin</title>
+<style>
+	body{margin:0;background:#000;color:#fff;font:12px system-ui}
+	#info{position:fixed;top:10px;left:10px;z-index:10;background:rgba(20,10,35,0.6);backdrop-filter:blur(10px);padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);max-width:320px}
+	#info h2{margin:0 0 6px;font-size:14px}
+	#info p{margin:0;color:#8a7da5;line-height:1.5}
+</style>
+</head>
+<body>
+<div id="info">
+	<h2>Galaxy + HDR Plugin</h2>
+	<p>This is a minimal galaxy-like HDR demo to show plugin usage.<br>
+	Original galaxy demo: <a href="https://github.com/luncat8/galaxy-star-movement-demo/blob/main/simple/simple-friction-field-webGPU.html" style="color:#6bd5ff">github link</a><br>
+	To use plugin with original: add<br>
+	<code>&lt;script src="../hdr-gainmap-plugin.js"&gt;&lt;/script&gt;</code><br>
+	before &lt;/body&gt;.<br><br>
+	Plugin adds <b>HDR 📸</b> button. Click → HDR→Save to capture current HDR frame as Ultra HDR JPEG.
+	</p>
+</div>
+<canvas id="sky" style="position:fixed;inset:0;width:100%;height:100%"></canvas>
+
+<script>
+'use strict';
+const TAU = Math.PI*2;
+const canvas = document.getElementById('sky');
+const N_DISK = 8000, N_BULGE = 1500;
+const CAM_DIST = 12.0, V0=1.8, SCENE_GAIN=1.5;
+let speed=1.0, damping=0.7, ecc_max=0.2, Omega_p=0.15, pitch_deg=15, num_arms=2, pattern_phase=0;
+let rotZ=0, tilt=1.2, zoom=1, tRotZ=0, tTilt=1.2, tZoom=1;
+let exposure=0, saturation=1, hdrHeadroom=4, showField=false, armTint=true, showTrails=false;
+let device, context, diskPipeline, bulgePipeline, bgPipeline, presentPipeline;
+let diskThetaBuffer, diskStaticBuffer, bulgeThetaBuffer, bulgeStaticBuffer;
+let diskCamBuffer, bulgeCamBuffer, bgUniformBuffer, presentUniformBuffer;
+let texSampler, fboTex=[null,null], fboViews=[null,null], bgBindGroups=[null,null], presentBindGroups=[null,null];
+let cur=0, W=0,H=0,DPR=1,fw=0,fh=0, gpuLost=false;
+const diskCamData=new Float32Array(16), bulgeCamData=new Float32Array(16), bgUniformData=new Float32Array(8), presentUniformData=new Float32Array(4);
+const r_arr=new Float32Array(N_DISK), theta_arr=new Float32Array(N_DISK), brightness_arr=new Float32Array(N_DISK), ecc_u_arr=new Float32Array(N_DISK), peri_arr=new Float32Array(N_DISK);
+const bulge_r=new Float32Array(N_BULGE), bulge_theta=new Float32Array(N_BULGE);
+for(let i=0;i<N_DISK;i++){ r_arr[i]=0.2+Math.pow(Math.random(),0.6)*6.5; theta_arr[i]=Math.random()*TAU; brightness_arr[i]=0.4+0.6*Math.random(); ecc_u_arr[i]=Math.random(); peri_arr[i]=Math.random()*TAU; }
+for(let i=0;i<N_BULGE;i++){ bulge_r[i]=0.1+Math.pow(Math.random(),2)*0.8; bulge_theta[i]=Math.random()*TAU; }
+const diskStatic=new Float32Array(N_DISK*6);
+for(let i=0;i<N_DISK;i++){ diskStatic[i*6]=r_arr[i]; diskStatic[i*6+1]=ecc_u_arr[i]; diskStatic[i*6+2]=peri_arr[i]; diskStatic[i*6+3]=brightness_arr[i]; diskStatic[i*6+4]=0.1; diskStatic[i*6+5]=0; }
+const bulgeStatic=new Float32Array(N_BULGE*5);
+for(let i=0;i<N_BULGE;i++){ bulgeStatic[i*5]=bulge_r[i]; bulgeStatic[i*5+1]=Math.random(); bulgeStatic[i*5+2]=Math.random()*TAU; bulgeStatic[i*5+3]=Math.random()*TAU; bulgeStatic[i*5+4]=Math.acos(2*Math.random()-1); }
+
+const WGSL_DISK=`
+struct CameraUniforms { cosR:f32, sinR:f32, cosT:f32, sinT:f32, scale:f32, halfW:f32, halfH:f32, camDist:f32, tanPitch:f32, patternPhase:f32, armOffset:f32, inv2Sig2:f32, eccMax:f32, pointSize:f32, armTint:f32, _pad:f32, };
+struct StarVertexOutput { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32>, @location(1) alpha: f32, @location(2) quadCoord: vec2<f32>, };
+@group(0) @binding(0) var<uniform> cam: CameraUniforms;
+@vertex fn vs_disk(@builtin(vertex_index) vi:u32, @location(0) th:f32, @location(1) aA:vec4<f32>, @location(2) aB:vec2<f32>) -> StarVertexOutput {
+  var quad=array<vec2<f32>,6>(vec2<f32>(-1,-1), vec2<f32>(1,-1), vec2<f32>(-1,1), vec2<f32>(-1,1), vec2<f32>(1,-1), vec2<f32>(1,1));
+  let qc=quad[vi]; let rho=aA.x*(1.0+cam.eccMax*aA.y*cos(th-aA.z)); let px=rho*cos(th); let py=rho*sin(th); let pz=aB.x*sin(2.0*th+aB.y);
+  let rx=px*cam.cosR-py*cam.sinR; let ry=px*cam.sinR+py*cam.cosR; let pjy=ry*cam.cosT-pz*cam.sinT; let pjz=ry*cam.sinT+pz*cam.cosT;
+  let ps=cam.camDist/(cam.camDist+pjz); let screen=vec2<f32>(rx,pjy)*(cam.scale*ps);
+  let pSize=cam.pointSize*max(ps,0.2); let clipPos=vec2<f32>(screen.x/cam.halfW, -screen.y/cam.halfH); let offset=qc*vec2<f32>(pSize*0.5/cam.halfW, pSize*0.5/cam.halfH);
+  var out:StarVertexOutput; out.position=vec4<f32>(clipPos+offset,0,1); out.color=mix(vec3<f32>(0.7,0.8,1.0), vec3<f32>(1.0,0.5,0.78), cam.armTint*0.5); out.alpha=aA.w*(0.4+ps*0.6); out.quadCoord=qc; return out;
+}
+@fragment fn fs_point(in:StarVertexOutput) -> @location(0) vec4<f32> {
+  let r2=dot(in.quadCoord,in.quadCoord); if(r2>1.0){discard;} let r=sqrt(r2); let a=select(mix(0.4,0.0,r*2.0-1.0), mix(1.0,0.4,r*2.0), r<0.5); return vec4<f32>(in.color*(in.alpha*a),1.0);
+}
+`;
+const WGSL_BULGE=`
+struct CameraUniforms { cosR:f32, sinR:f32, cosT:f32, sinT:f32, scale:f32, halfW:f32, halfH:f32, camDist:f32, tanPitch:f32, patternPhase:f32, armOffset:f32, inv2Sig2:f32, eccMax:f32, pointSize:f32, armTint:f32, _pad:f32, };
+struct StarVertexOutput { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32>, @location(1) alpha: f32, @location(2) quadCoord: vec2<f32>, };
+@group(0) @binding(0) var<uniform> cam: CameraUniforms;
+@vertex fn vs_bulge(@builtin(vertex_index) vi:u32, @location(0) th:f32, @location(1) aA:vec3<f32>, @location(2) aB:vec2<f32>) -> StarVertexOutput {
+  var quad=array<vec2<f32>,6>(vec2<f32>(-1,-1), vec2<f32>(1,-1), vec2<f32>(-1,1), vec2<f32>(-1,1), vec2<f32>(1,-1), vec2<f32>(1,1));
+  let qc=quad[vi]; let rho=aA.x*(1.0+cam.eccMax*aA.y*cos(th-aA.z)); let x0=rho*cos(th); let y0=rho*sin(th); let cO=cos(aB.x); let sO=sin(aB.x); let x1=x0*cO-y0*sO; let y1=x0*sO+y0*cO; let cI=cos(aB.y); let sI=sin(aB.y); let px=x1; let py=y1*cI; let pz=y1*sI;
+  let rx=px*cam.cosR-py*cam.sinR; let ry=px*cam.sinR+py*cam.cosR; let pjy=ry*cam.cosT-pz*cam.sinT; let pjz=ry*cam.sinT+pz*cam.cosT;
+  let ps=cam.camDist/(cam.camDist+pjz); let screen=vec2<f32>(rx,pjy)*(cam.scale*ps); let pSize=cam.pointSize*max(ps,0.2); let clipPos=vec2<f32>(screen.x/cam.halfW, -screen.y/cam.halfH); let offset=qc*vec2<f32>(pSize*0.5/cam.halfW, pSize*0.5/cam.halfH);
+  var out:StarVertexOutput; out.position=vec4<f32>(clipPos+offset,0,1); out.color=vec3<f32>(1.0,0.78,0.39); out.alpha=0.8*ps; out.quadCoord=qc; return out;
+}
+@fragment fn fs_point(in:StarVertexOutput) -> @location(0) vec4<f32> { let r2=dot(in.quadCoord,in.quadCoord); if(r2>1.0){discard;} let r=sqrt(r2); let a=select(mix(0.4,0.0,r*2.0-1.0), mix(1.0,0.4,r*2.0), r<0.5); return vec4<f32>(in.color*(in.alpha*a),1.0); }
+`;
+const WGSL_BG=`
+struct QuadVertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
+@vertex fn vs_quad(@builtin(vertex_index) vi:u32) -> QuadVertexOutput { var pos=array<vec2<f32>,3>(vec2<f32>(-1,-1), vec2<f32>(3,-1), vec2<f32>(-1,3)); var out:QuadVertexOutput; out.position=vec4<f32>(pos[vi],0,1); out.uv=pos[vi]*vec2<f32>(0.5,-0.5)+vec2<f32>(0.5,0.5); return out; }
+struct BgUniforms { resolution: vec2<f32>, glowR:f32, mode:f32, fade:f32, _pad0:f32, _pad1:f32, _pad2:f32, };
+@group(0) @binding(0) var<uniform> uBg: BgUniforms; @group(0) @binding(1) var uPrevTex: texture_2d<f32>; @group(0) @binding(2) var uSampler: sampler;
+@fragment fn fs_bg(in:QuadVertexOutput) -> @location(0) vec4<f32> {
+  if(uBg.mode<0.5){ let pix=in.uv*uBg.resolution; let c=uBg.resolution*0.5; let d1=length(pix-c)/max(max(uBg.resolution.x,uBg.resolution.y),1.0); let bg=mix(vec3<f32>(0.04,0.02,0.07), vec3<f32>(0.008,0.004,0.03), clamp(d1,0,1)); return vec4<f32>(bg,1.0); } else { let prev=textureSample(uPrevTex,uSampler,in.uv).rgb; return vec4<f32>(prev*uBg.fade,1.0); }
+}
+`;
+const WGSL_PRESENT=`
+struct VSOut { @builtin(position) position: vec4f, @location(0) uv: vec2f, };
+@vertex fn vs_quad(@builtin(vertex_index) vi:u32) -> VSOut { var positions=array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3)); var out:VSOut; out.position=vec4f(positions[vi],0,1); out.uv=positions[vi]*vec2f(0.5,-0.5)+vec2f(0.5,0.5); return out; }
+struct PresentUniforms { exposure:f32, saturation:f32, headroom:f32, _pad:f32, };
+@group(0) @binding(0) var<uniform> uGrad: PresentUniforms; @group(0) @binding(1) var uSceneTex: texture_2d<f32>; @group(0) @binding(2) var uSampler: sampler;
+@fragment fn fs_present(in:VSOut) -> @location(0) vec4f {
+  let raw=textureSample(uSceneTex,uSampler,in.uv).rgb; let c_exp=raw*uGrad.exposure; let lum=dot(c_exp, vec3f(0.2126,0.7152,0.0722)); var c_sat=mix(vec3f(lum), c_exp, uGrad.saturation); c_sat=max(c_sat, vec3f(0.0));
+  let peak=max(c_sat.r, max(c_sat.g, c_sat.b)); let H=max(uGrad.headroom,0.5); let mappedPeak=(peak*H)*inverseSqrt(H*H+peak*peak); let scale=select(1.0, mappedPeak/max(peak,1e-6), peak>0.0); let c_hdr=c_sat*scale; return vec4f(c_hdr,1.0);
+}
+`;
+
+async function initWebGPU(){
+	if(!navigator.gpu){ document.body.innerHTML+='<p>WebGPU not available</p>'; return false; }
+	var adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+	device=await adapter.requestDevice();
+	context=canvas.getContext('webgpu');
+	var format='rgba16float';
+	context.configure({ device, format, colorSpace:'srgb', toneMapping:{mode:'extended'}, alphaMode:'opaque' });
+	var diskModule=device.createShaderModule({code:WGSL_DISK});
+	var bulgeModule=device.createShaderModule({code:WGSL_BULGE});
+	var bgModule=device.createShaderModule({code:WGSL_BG});
+	var presentModule=device.createShaderModule({code:WGSL_PRESENT});
+	texSampler=device.createSampler({minFilter:'nearest',magFilter:'nearest'});
+	diskThetaBuffer=device.createBuffer({size:N_DISK*4, usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+	diskStaticBuffer=device.createBuffer({size:diskStatic.byteLength, usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+	device.queue.writeBuffer(diskStaticBuffer,0,diskStatic);
+	bulgeThetaBuffer=device.createBuffer({size:N_BULGE*4, usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+	bulgeStaticBuffer=device.createBuffer({size:bulgeStatic.byteLength, usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+	device.queue.writeBuffer(bulgeStaticBuffer,0,bulgeStatic);
+	diskCamBuffer=device.createBuffer({size:64, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+	bulgeCamBuffer=device.createBuffer({size:64, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+	bgUniformBuffer=device.createBuffer({size:32, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+	presentUniformBuffer=device.createBuffer({size:16, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+	var additiveBlend={color:{operation:'add',srcFactor:'one',dstFactor:'one'}, alpha:{operation:'add',srcFactor:'zero',dstFactor:'one'}};
+	diskPipeline=device.createRenderPipeline({layout:'auto', vertex:{module:diskModule, entryPoint:'vs_disk', buffers:[{arrayStride:4, stepMode:'instance', attributes:[{shaderLocation:0,offset:0,format:'float32'}]}, {arrayStride:24, stepMode:'instance', attributes:[{shaderLocation:1,offset:0,format:'float32x4'},{shaderLocation:2,offset:16,format:'float32x2'}]}]}, fragment:{module:diskModule, entryPoint:'fs_point', targets:[{format:'rgba16float', blend:additiveBlend}]}, primitive:{topology:'triangle-list'}});
+	bulgePipeline=device.createRenderPipeline({layout:'auto', vertex:{module:bulgeModule, entryPoint:'vs_bulge', buffers:[{arrayStride:4, stepMode:'instance', attributes:[{shaderLocation:0,offset:0,format:'float32'}]}, {arrayStride:20, stepMode:'instance', attributes:[{shaderLocation:1,offset:0,format:'float32x3'},{shaderLocation:2,offset:12,format:'float32x2'}]}]}, fragment:{module:bulgeModule, entryPoint:'fs_point', targets:[{format:'rgba16float', blend:additiveBlend}]}, primitive:{topology:'triangle-list'}});
+	bgPipeline=device.createRenderPipeline({layout:'auto', vertex:{module:bgModule, entryPoint:'vs_quad'}, fragment:{module:bgModule, entryPoint:'fs_bg', targets:[{format:'rgba16float'}]}, primitive:{topology:'triangle-list'}});
+	presentPipeline=device.createRenderPipeline({layout:'auto', vertex:{module:presentModule, entryPoint:'vs_quad'}, fragment:{module:presentModule, entryPoint:'fs_present', targets:[{format:'rgba16float'}]}, primitive:{topology:'triangle-list'}});
+	var diskBG=device.createBindGroup({layout:diskPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:diskCamBuffer}}]});
+	var bulgeBG=device.createBindGroup({layout:bulgePipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:bulgeCamBuffer}}]});
+	window._diskBG=diskBG; window._bulgeBG=bulgeBG;
+	resize(); return true;
+}
+function createTargets(){
+	if(!device) return;
+	for(let i=0;i<2;i++){ if(fboTex[i]) fboTex[i].destroy(); }
+	fw=canvas.width; fh=canvas.height;
+	for(let i=0;i<2;i++){ fboTex[i]=device.createTexture({size:[fw,fh], format:'rgba16float', usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}); fboViews[i]=fboTex[i].createView(); }
+	for(let i=0;i<2;i++){
+		bgBindGroups[i]=device.createBindGroup({layout:bgPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:bgUniformBuffer}},{binding:1,resource:fboViews[1-i]},{binding:2,resource:texSampler}]});
+		presentBindGroups[i]=device.createBindGroup({layout:presentPipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:presentUniformBuffer}},{binding:1,resource:fboViews[i]},{binding:2,resource:texSampler}]});
+	}
+	cur=0;
+}
+function resize(){
+	DPR=Math.min(window.devicePixelRatio||1,2); W=innerWidth; H=innerHeight;
+	canvas.width=Math.max(1,Math.round(W*DPR)); canvas.height=Math.max(1,Math.round(H*DPR));
+	canvas.style.width=W+'px'; canvas.style.height=H+'px';
+	createTargets();
+}
+window.addEventListener('resize', resize);
+function update(dt){
+	for(let i=0;i<N_DISK;i++){ theta_arr[i]+= (V0/(r_arr[i]+0.2))*dt; if(theta_arr[i]>TAU) theta_arr[i]-=TAU; }
+	for(let i=0;i<N_BULGE;i++){ bulge_theta[i]+= (1.5/Math.max(0.2,bulge_r[i]))*dt; if(bulge_theta[i]>TAU) bulge_theta[i]-=TAU; }
+}
+function render(simDt){
+	if(simDt>0){ update(simDt); device.queue.writeBuffer(diskThetaBuffer,0,theta_arr); device.queue.writeBuffer(bulgeThetaBuffer,0,bulge_theta); }
+	var tan_pitch=Math.tan(pitch_deg*Math.PI/180); var scalePx=Math.min(W,H)/14*zoom*DPR; var cosR=Math.cos(rotZ), sinR=Math.sin(rotZ), cosT=Math.cos(tilt), sinT=Math.sin(tilt);
+	diskCamData[0]=cosR; diskCamData[1]=sinR; diskCamData[2]=cosT; diskCamData[3]=sinT; diskCamData[4]=scalePx; diskCamData[5]=fw*0.5; diskCamData[6]=fh*0.5; diskCamData[7]=CAM_DIST; diskCamData[8]=tan_pitch; diskCamData[9]=pattern_phase; diskCamData[10]=TAU/num_arms; diskCamData[11]=1/0.125; diskCamData[12]=ecc_max; diskCamData[13]=8*DPR; diskCamData[14]=armTint?1:0; diskCamData[15]=0;
+	device.queue.writeBuffer(diskCamBuffer,0,diskCamData);
+	for(let i=0;i<16;i++) bulgeCamData[i]=diskCamData[i]; bulgeCamData[13]=6*DPR; device.queue.writeBuffer(bulgeCamBuffer,0,bulgeCamData);
+	bgUniformData[0]=fw; bgUniformData[1]=fh; bgUniformData[2]=Math.min(W,H)*0.15*zoom*DPR; bgUniformData[3]=showTrails?1:0; bgUniformData[4]=0.85; device.queue.writeBuffer(bgUniformBuffer,0,bgUniformData);
+	presentUniformData[0]=SCENE_GAIN*Math.pow(2,exposure); presentUniformData[1]=saturation; presentUniformData[2]=hdrHeadroom; presentUniformData[3]=0; device.queue.writeBuffer(presentUniformBuffer,0,presentUniformData);
+	var encoder=device.createCommandEncoder();
+	var scenePassDesc={colorAttachments:[{view:fboViews[cur], loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
+	var pass1=encoder.beginRenderPass(scenePassDesc);
+	pass1.setPipeline(bgPipeline); pass1.setBindGroup(0,bgBindGroups[cur]); pass1.draw(3);
+	pass1.setPipeline(bulgePipeline); pass1.setBindGroup(0,window._bulgeBG); pass1.setVertexBuffer(0,bulgeThetaBuffer); pass1.setVertexBuffer(1,bulgeStaticBuffer); pass1.draw(6,N_BULGE);
+	pass1.setPipeline(diskPipeline); pass1.setBindGroup(0,window._diskBG); pass1.setVertexBuffer(0,diskThetaBuffer); pass1.setVertexBuffer(1,diskStaticBuffer); pass1.draw(6,N_DISK);
+	pass1.end();
+	var presentPassDesc={colorAttachments:[{view:context.getCurrentTexture().createView(), loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store'}]};
+	var pass2=encoder.beginRenderPass(presentPassDesc);
+	pass2.setPipeline(presentPipeline); pass2.setBindGroup(0,presentBindGroups[cur]); pass2.draw(3); pass2.end();
+	device.queue.submit([encoder.finish()]);
+	cur=1-cur;
+}
+var isDragging=false,lastX=0,lastY=0;
+canvas.addEventListener('pointerdown',e=>{isDragging=true;lastX=e.clientX;lastY=e.clientY;});
+canvas.addEventListener('pointermove',e=>{if(!isDragging)return;var dx=e.clientX-lastX,dy=e.clientY-lastY;tRotZ-=dx*0.005;tTilt-=dy*0.005;lastX=e.clientX;lastY=e.clientY;});
+canvas.addEventListener('pointerup',()=>{isDragging=false;});
+canvas.addEventListener('wheel',e=>{e.preventDefault();tZoom*=e.deltaY>0?0.92:1.08;tZoom=Math.max(0.4,Math.min(3,tZoom));},{passive:false});
+let lastTime=performance.now();
+function loop(now){
+	var dt=Math.min(0.05,(now-lastTime)/1000); lastTime=now;
+	if(device){ rotZ+=(tRotZ-rotZ)*0.1; tilt+=(tTilt-tilt)*0.1; zoom+=(tZoom-zoom)*0.1; pattern_phase+=Omega_p*dt*speed*0.5; render(dt); }
+	requestAnimationFrame(loop);
+}
+initWebGPU().then(ok=>{if(ok) requestAnimationFrame(loop);});
+</script>
+
+<script src="../hdr-gainmap-plugin.js"></script>
+</body>
+</html>
