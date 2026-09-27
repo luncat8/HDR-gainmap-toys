@@ -157,6 +157,22 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
 * **swapchain `usage` must include `COPY_SRC`.** Default `configure({})` usage is `RENDER_ATTACHMENT` only, so the injected `copyTextureToBuffer` fails with `usage (TextureUsage::RenderAttachment) doesn't include TextureUsage::CopySrc` (on Windows the texture is named `D3DImageBacking_D3DSharedImage_WebGPUSwapBufferProvider_…`). Fix: in the wrapped `configure`, OR `COPY_SRC | TEXTURE_BINDING` into `config.usage` before calling the original. Belt and suspenders: examples also pass `usage:` explicitly. Canvases configured *before* the plugin script ran keep the old usage — reload with the script in `<head>`; the submit patch reports this case instead of poisoning the whole submit batch.
 * **never probe canvas type with `getContext('2d')`.** On a canvas with no context yet it *creates* a 2d context and steals the canvas — the app's later `getContext('webgpu')` then returns null and the HDR demo is dead. Instead record the type inside the patched `getContext` (`canvas._hdrCtxType = type`) and classify from that + `webgpuMap` without touching the canvas.
 * **`layout:'auto'` drops unused WGSL bindings.** A declared-but-never-sampled `var samp: sampler` is eliminated, so `createBindGroup` with `{binding:1}` fails with `binding index 1 not present in the bind group layout` and poisons the whole command buffer (`Invalid BindGroup → Invalid CommandBuffer → Queue.Submit` cascade). Fix: delete unused declarations from the demo shader (or build an explicit `BindGroupLayout`). Verified in `examples/hdr-canvas-demo.html`.
+* **a swapchain texture may only be copied inside the task that acquired it.**
+  `getCurrentTexture()` hands out a texture that Chrome destroys when that task
+  ends, so the plugin's injected `copyTextureToBuffer` must land in a submit from
+  the *same* task. With two canvases on one device (or two submits per frame) the
+  other canvas' stored texture is already gone and the copy fails with
+  `Destroyed texture [Texture "D3DImageBacking_D3DSharedImage_WebGPUSwapBufferProvider_…"]
+  used in a submit`, which invalidates the whole batch — the app's own frame dies
+  with it. Fix: mark the texture fresh in the patched `getCurrentTexture` and clear
+  the flag from a `queueMicrotask` (microtasks run after the task's synchronous
+  work, so the flag is true exactly while the texture is copyable); submits with a
+  stale texture skip the copy and the request waits for the next frame.
+  Regression-tested in `tests/node/plugin.smoke.js`.
+* **keep an HDR canvas' ancestors plain.** `border-radius` + `overflow:hidden`
+  (and filters, opacity, backdrop-filter) around a float16 canvas invite Chrome to
+  composite it through an SDR intermediate, which looks exactly like "the HDR
+  preview is flat". The plugin's preview wrapper is a plain background now.
 * detection: scan `document.querySelectorAll('canvas')` every 2s + `MutationObserver` (skipping the plugin's own nodes); per-canvas type: `webgpuMap` format (`rgba16float` = hdr) else recorded `_hdrCtxType`, never a live `getContext` call. Skip `drawImage` thumbnails for any `webgpu*` canvas.
 * **swapchain transfer function (calibration root cause).** `rgba16float` + `colorSpace:'srgb'` + `toneMapping:'extended'` holds *extended-sRGB* (OETF-encoded, range past 1.0): the spec interprets stored values in the canvas color space and the display applies the EOTF, so the shader must encode (`linearToSrgb`, extended past 1) — wgpu docs' "ExtendedSrgb" row and ccameron-chromium/webgpu-hdr ("converted to the color space of the screen") agree. Writing linear instead shows crushed mids + nuclear highlights with no error; starfields hide it (blacks stay black), which is why the upstream galaxy demo's "direct linear HDR values" comment is wrong. All repo demos now encode; `examples/hdr-canvas-demo.html` has a calibration strip (raw 0.25/0.5/0.75/1.0/2.0 patches + CSS twins that must match).
 * **HDR editor pipeline (plugin).** Readback bytes are decoded extended-sRGB → linear once (`srgbToLinearData`), then: `fs_tonemap` (exposure × peak-preserving compress `H/sqrt(H²+peak²)` + clamp + sRGB encode → `sdrTex`) → `fs_hdr_to_gain` (exposure-aware HDR vs decoded base → recovery normalized by CPU-scanned content range) → `fs_apply` (exact decoder formula with weight from the headroom slider) → present. Preview = "this file on an H× display", so the headroom slider visibly dims/boosts; capacity metadata mirrors the content range (like Pixel files), peak/sdrWhite sliders are SDR-mode-only. Exposure is baked in tonemap/gain, so present runs as a second submit with exposure 0 (one UBO can't hold both). CPU save (`encodeFromHDR`) uses the identical formula with block-averaged gain, so preview == file.
@@ -170,14 +186,17 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
   `tests/node/plugin.smoke.js` drives `captureSDR` / `captureHDR` against a stub DOM
   + WebGPU and reproduces exactly that stack trace when the seed is removed.
 * **transfer function: measure, never assume.** "Do these two greys match?" is a
-  useless question (observers disagree about which side is darker). Ask instead
-  *which of two candidates vanishes*: put the CSS grey as a surround and draw two
-  canvas patches inside it — `A = 0.5` (right if the swapchain is gamma-encoded)
-  and `B = 0.216` (right if it is linear). Exactly one merges with the surround.
-  `examples/hdr-selftest.html` Test 1 does this for 0.25 / 0.5 / 0.75. Until it is
-  settled on real hardware, both demos and the plugin take `?linear=1` to present
-  linear light instead of extended sRGB (the plugin also has a checkbox-free
-  uniform, `P.c.z`), so flipping the assumption is one URL away, not a rewrite.
+  useless question (observers disagree about which side is darker, and both
+  hypotheses converge at 1.0). Ask instead *which of two candidates vanishes*: put
+  the CSS grey as a surround and draw two canvas patches inside it — `A = 0.5`
+  (right if the swapchain is gamma-encoded) and `B = 0.216` (right if it is
+  linear). Exactly one merges with the surround. `examples/hdr-selftest.html`
+  Test 1 does this for 0.25 / 0.5 / 0.75.
+  **Measured, Chrome on Windows (D3D), HDR display: A vanishes, B is visibly
+  darker than its surround** → `rgba16float` + `colorSpace:'srgb'` +
+  `toneMapping:'extended'` really is *encoded* extended sRGB, so shaders must
+  apply the OETF. That matches the spec, the wgpu `ExtendedSrgb` row and Chrome's
+  own particles-HDR sample (it scales an already-encoded texture by up to 4).
 * **"HDR stopped working" triage.** `examples/hdr-selftest.html` writes fixed values
   (0.25…4.0) straight into the swapchain, next to CSS grey twins: patches vs twins =
   transfer function check, 1.25…4.0 vs 1.0 = is-this-display-HDR check, and the 0→4

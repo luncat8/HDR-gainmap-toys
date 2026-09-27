@@ -27,7 +27,6 @@
 <div class="controls">
 	<label>Exposure <input id="exposure" type="range" min="-2" max="3" step="0.1" value="0"><span id="expVal">0.0 EV</span></label>
 	<label>Headroom <input id="headroom" type="range" min="1" max="8" step="0.25" value="4"><span id="hrVal">4.0×</span></label>
-	<label>sRGB OETF out <input id="encode" type="checkbox" checked></label>
 </div>
 <div id="ladder"></div>
 <div id="hdrstate">checking HDR state…</div>
@@ -51,9 +50,6 @@
 'use strict';
 var canvas = document.getElementById('sky');
 var exposure = 0, headroom = 4;
-// `?linear=1` presents linear light instead of extended sRGB — the A/B for
-// "which transfer function does this swapchain actually carry?"
-var encodeOutput = new URLSearchParams(location.search).get('linear') !== '1';
 var device, context, pipeline, uniBuf, bindGroup;
 var uniData = new Float32Array(8);
 var W=0,H=0,DPR=1;
@@ -64,7 +60,7 @@ var LADDER = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 function srgbEotf(v){ return v <= 0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); }
 
 var wgsl = `
-struct U { exposure: f32, headroom: f32, time: f32, encode: f32, width: f32, height: f32, _pad2: f32, _pad3: f32, }
+struct U { exposure: f32, headroom: f32, time: f32, _pad: f32, width: f32, height: f32, _pad2: f32, _pad3: f32, }
 @group(0) @binding(0) var<uniform> u: U;
 fn linearToSrgb(c: vec3f) -> vec3f {
   let x = max(c, vec3f(0.0));
@@ -86,9 +82,6 @@ fn hdrKnee(peak: f32, H: f32) -> f32 {
   var p = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
   return vec4f(p[i],0,1);
 }
-// encode = 1: extended sRGB swapchain (OETF here, display applies the EOTF).
-// encode = 0: linear swapchain — write linear light, encoding would wash it out.
-fn encodeOut(c: vec3f) -> vec3f { return select(max(c, vec3f(0.0)), linearToSrgb(c), u.encode > 0.5); }
 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let uv = pos.xy / vec2f(max(u.width,1.0), max(u.height,1.0));
   if (uv.y > 0.93) {
@@ -118,7 +111,7 @@ fn encodeOut(c: vec3f) -> vec3f { return select(max(c, vec3f(0.0)), linearToSrgb
   col = col * exp2(u.exposure) * 1.5;
   let peak = max(col.r, max(col.g, col.b));
   col = col * select(1.0, hdrKnee(peak, u.headroom)/max(peak,1e-6), peak > 1.0);
-  return vec4f(encodeOut(col), 1.0);
+  return vec4f(linearToSrgb(col), 1.0);
 }
 `;
 
@@ -158,7 +151,6 @@ function reportHDR(){
 		' · toneMapping <b>' + mode + '</b>' +
 		' · display headroom <b>' + (hr === null ? 'not reported' : hr.toFixed(2) + '×') + '</b>' +
 		' · dynamic-range:high <b>' + (wide ? 'yes' : 'no') + '</b>' +
-		' · output ' + (encodeOutput ? 'extended sRGB (OETF applied)' : 'linear (no OETF)') +
 		' · plugin ' + (window.HDRGainmapPlugin ? 'loaded' : 'absent') +
 		(hr !== null && headroom > hr ? ' — tone map targets ' + headroom.toFixed(2) + '×, above what the display can show' : '');
 }
@@ -199,7 +191,7 @@ var t0 = performance.now();
 function loop(now){
 	if (!device) { requestAnimationFrame(loop); return; }
 	var dt = now - t0;
-	uniData[0] = exposure; uniData[1] = headroom; uniData[2] = dt; uniData[3] = encodeOutput ? 1 : 0;
+	uniData[0] = exposure; uniData[1] = headroom; uniData[2] = dt; uniData[3] = 0;
 	uniData[4] = canvas.width; uniData[5] = canvas.height; uniData[6] = 0; uniData[7] = 0;
 	try {
 		device.queue.writeBuffer(uniBuf,0,uniData);
@@ -215,8 +207,6 @@ function loop(now){
 }
 document.getElementById('exposure').addEventListener('input', function(e){ exposure=parseFloat(e.target.value); document.getElementById('expVal').textContent= (exposure>=0?'+':'')+exposure.toFixed(1)+' EV'; });
 document.getElementById('headroom').addEventListener('input', function(e){ headroom=parseFloat(e.target.value); document.getElementById('hrVal').textContent=headroom.toFixed(1)+'×'; });
-document.getElementById('encode').checked = encodeOutput;
-document.getElementById('encode').addEventListener('change', function(e){ encodeOutput = e.target.checked; reportHDR(); });
 init();
 </script>
 </body>

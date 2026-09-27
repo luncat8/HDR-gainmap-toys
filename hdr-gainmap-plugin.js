@@ -161,9 +161,6 @@
 		try { return new URLSearchParams(location.search).get(name) === '1'; } catch (e) { return false; }
 	}
 	var noSwapchainCopy = urlFlag('hdrNoCopy');
-	// extended-sRGB swapchains want the OETF in-shader; `?linear=1` presents linear
-	// light instead, to A/B a swapchain that turns out to carry a linear signal.
-	var outputEncode = !urlFlag('linear');
 
 	function wrapContext(canvas, ctx) {
 		if (ctx._hdrPatched) return;
@@ -209,9 +206,24 @@
 				info.lastTexture = tex;
 				info.width = tex.width;
 				info.height = tex.height;
+				markFresh(info);
 			}
 			return tex;
 		};
+	}
+
+	// A swapchain texture is only valid until the end of the task that acquired it
+	// (Chrome then destroys it — "Destroyed texture [D3DImageBacking_…] used in a
+	// submit"). Apps with two canvases or two submits per frame therefore hit
+	// submits where *another* canvas' stored texture is already gone, and a copy
+	// injected there invalidates the whole batch, killing the app's frame too.
+	// A microtask runs after the current task's synchronous work, so this flag is
+	// true exactly while the texture can still be copied.
+	function markFresh(info) {
+		info.fresh = true;
+		if (info.freshScheduled) return;
+		info.freshScheduled = true;
+		queueMicrotask(function () { info.fresh = false; info.freshScheduled = false; });
 	}
 
 	function formatBpp(fmt) {
@@ -231,7 +243,7 @@
 			if (canvases) {
 				canvases.forEach(function (c) {
 					var info = webgpuMap.get(c);
-					if (info && info.pending && info.lastTexture) pendingList.push(info);
+					if (info && info.pending && info.lastTexture && info.fresh) pendingList.push(info);
 				});
 			}
 			if (pendingList.length) {
@@ -348,7 +360,7 @@
 			setTimeout(function () {
 				if (info.pending && info.pending.resolve === resolve) {
 					info.pending = null;
-					reject(new Error('HDR readback timeout — no frame submitted'));
+					reject(new Error('HDR readback timeout — canvas submitted no frame with a live swapchain texture'));
 				}
 			}, 2000);
 		});
@@ -435,13 +447,11 @@ fn weight() -> f32 {
   let sdr = srgbToLinear(textureSampleLevel(tex0,samp,in.uv,0.0).rgb); let rec = textureSampleLevel(tex1,samp,in.uv,0.0).r; let logBoost = mix(P.a.x, P.a.y, rec); let g = exp2(logBoost*weight()); return vec4f(max(sdr*g, vec3f(0.0)), 1.0);
 }
 @fragment fn fs_present(in : VSOut) -> @location(0) vec4f {
-  // P.c.z selects the swapchain transfer function: 1 = extended sRGB (encode
-  // here, display applies the EOTF), 0 = linear swapchain (write linear light).
-  let encode = P.c.z > 0.5;
+  // the preview canvas is extended sRGB: encode here, the display applies the EOTF
   let c = textureSampleLevel(tex0,samp,in.uv,0.0);
-  if (P.b.z > 2.5) { return vec4f(select(srgbToLinear(c.rgb), c.rgb, encode), 1.0); }
-  let scale = exp2(P.b.x); let rgb = select(c.rgb, vec3f(c.r), P.b.z > 1.5) * scale;
-  return vec4f(select(max(rgb, vec3f(0.0)), linearToSrgb(rgb), encode), 1.0);
+  if (P.b.z > 2.5) { return vec4f(c.rgb, 1.0); }
+  let scale = exp2(P.b.x); let rgb = select(c.rgb, vec3f(c.r), P.b.z > 1.5);
+  return vec4f(linearToSrgb(rgb*scale), 1.0);
 }
 @fragment fn fs_hist(in : VSOut) -> @location(0) vec4f {
   let a = srgbToLinear(textureSampleLevel(tex0,samp,in.uv,0.0).rgb); let b = textureSampleLevel(tex1,samp,in.uv,0.0).rgb; return vec4f(log2(max(luma(a),1e-6)), log2(max(luma(b),1e-6)), 0.0, 1.0);
@@ -575,7 +585,7 @@ fn weight() -> f32 {
 <div class="canvas-list" id="hdr-canvas-list"></div>
 <div id="hdr-editor" class="hidden">
 <h3>Editor</h3>
-<div id="hdr-preview-wrap" style="background:#000;border-radius:8px;overflow:hidden"><canvas id="hdr-preview" style="width:100%;display:block"></canvas></div>
+<div id="hdr-preview-wrap" style="background:#000"><canvas id="hdr-preview" style="width:100%;display:block"></canvas></div>
 <div id="hdr-viewrow" style="display:flex;gap:6px;margin:6px 0">
 <button data-view="hdr" style="flex:1">HDR</button>
 <button data-view="sdr" style="flex:1">SDR base</button>
@@ -969,8 +979,7 @@ fn weight() -> f32 {
 		var proc = gpuProc;
 		proc.params[0] = p.rangeMin; proc.params[1] = p.rangeMax; proc.params[2] = p.capacityMin; proc.params[3] = p.capacityMax;
 		proc.params[4] = p.exposure; proc.params[5] = Math.log2(p.headroom); proc.params[6] = p.mode; proc.params[7] = p.gainScale;
-		proc.params[8] = state.srcW; proc.params[9] = state.srcH;
-		proc.params[10] = outputEncode ? 1 : 0; proc.params[11] = 0;
+		proc.params[8] = state.srcW; proc.params[9] = state.srcH; proc.params[10] = gainW; proc.params[11] = gainH;
 		proc.params.set(state.lut, 12);
 		proc.device.queue.writeBuffer(proc.ubo, 0, proc.params);
 	}

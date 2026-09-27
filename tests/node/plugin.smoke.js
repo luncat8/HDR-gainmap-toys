@@ -137,7 +137,7 @@ global.GPUTextureUsage = { RENDER_ATTACHMENT: 16, TEXTURE_BINDING: 4, COPY_SRC: 
 global.GPUShaderStage = { FRAGMENT: 2, VERTEX: 1 };
 global.GPUMapMode = { READ: 1 };
 
-const calls = { submits: 0, passes: 0, textures: [], configures: [] };
+const calls = { submits: 0, passes: 0, copies: 0, textures: [], configures: [] };
 
 function makeDevice() {
 	return {
@@ -159,7 +159,7 @@ function makeDevice() {
 		},
 		createCommandEncoder: () => ({
 			beginRenderPass: () => { calls.passes++; return { setPipeline() {}, setBindGroup() {}, draw() {}, end() {} }; },
-			copyTextureToBuffer() {},
+			copyTextureToBuffer() { calls.copies++; },
 			finish: () => ({})
 		}),
 		queue: { writeBuffer() {}, writeTexture() {}, submit() { calls.submits++; } }
@@ -216,6 +216,31 @@ const plugin = require(pluginPath);
 	check('HDR capture succeeded', /^HDR captured 64×32/.test(status()), JSON.stringify(status()));
 	check('HDR pipeline allocated an rgba16float source', calls.textures.includes('rgba16float 64x32'), calls.textures.join(' | '));
 	check('gain map is 1/4 of the HDR source', calls.textures.includes('rgba8unorm 16x8'), calls.textures.join(' | '));
+
+	// Two canvases on one device: a submit for canvas A must not try to copy
+	// canvas B's swapchain texture from an earlier task — Chrome has destroyed it
+	// by then ("Destroyed texture [D3DImageBacking_…] used in a submit"), and the
+	// injected copy would invalidate the app's own command buffers too.
+	const otherCanvas = makeCanvas(32, 16);
+	const otherCtx = otherCanvas.getContext('webgpu');
+	otherCtx.configure({ device: appDevice, format: 'rgba16float', colorSpace: 'srgb', toneMapping: { mode: 'extended' }, alphaMode: 'opaque' });
+	ctx.getCurrentTexture();                 // frame N: canvas A acquires, texture expires with this task
+	await new Promise(r => setTimeout(r, 0));
+	const copiesBefore = calls.copies;
+	let copiesAfterStaleSubmit = -1;
+	const stale = plugin.captureHDR(hdrCanvas);
+	setTimeout(() => {
+		otherCtx.getCurrentTexture();
+		appDevice.queue.submit([]);          // frame N+1, other canvas: A's texture is stale, skip it
+		copiesAfterStaleSubmit = calls.copies;
+		ctx.getCurrentTexture();
+		appDevice.queue.submit([]);          // A acquires again in this task: now copyable
+	}, 0);
+	await stale;
+	check('stale swapchain texture is not copied', copiesAfterStaleSubmit === copiesBefore,
+		copiesAfterStaleSubmit + ' copies after the stale submit, ' + copiesBefore + ' before');
+	check('the live frame did inject the copy', calls.copies === copiesBefore + 1, calls.copies);
+	check('capture still resolves on the next live frame', /^HDR captured 64×32/.test(status()), JSON.stringify(status()));
 
 	await new Promise(r => setTimeout(r, 30));
 	check('no unhandled rejections', errors.length === 0, errors.map(e => (e && e.stack) || String(e)).join(' | '));
