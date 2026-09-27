@@ -12,9 +12,13 @@
 	canvas{border:1px solid rgba(255,255,255,0.08);border-radius:12px;background:#000;display:block;max-width:100%}
 	#sky{width:min(900px,100%);height:520px}
 	#info{color:#8a7da5;font-size:11px;margin-top:10px;max-width:900px;line-height:1.6;letter-spacing:0.02em}
+	#hdrstate{max-width:900px;margin:10px 0;padding:6px 10px;border:1px solid rgba(255,255,255,0.12);border-radius:8px;font-size:11px;line-height:1.6}
+	#hdrstate b{color:#ff7ba8}
 	.controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
 	.controls label{font-size:10px;letter-spacing:0.15em;text-transform:uppercase;color:#8a7da5;display:flex;flex-direction:column;gap:4px}
 	input[type=range]{width:160px;accent-color:#ff7ba8}
+	#ladder{display:flex;gap:0;max-width:900px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;overflow:hidden;margin-top:8px}
+	#ladder div{flex:1;font-size:10px;padding:4px 6px;text-align:center;line-height:1.4}
 </style>
 </head>
 <body>
@@ -22,23 +26,24 @@
 <canvas id="sky"></canvas>
 <div class="controls">
 	<label>Exposure <input id="exposure" type="range" min="-2" max="3" step="0.1" value="0"><span id="expVal">0.0 EV</span></label>
-	<label>Headroom <input id="headroom" type="range" min="1" max="6" step="0.5" value="4"><span id="hrVal">4.0×</span></label>
+	<label>Headroom <input id="headroom" type="range" min="1" max="8" step="0.25" value="4"><span id="hrVal">4.0×</span></label>
 </div>
-<div id="caltwins" style="display:flex;gap:0;margin-top:8px;max-width:900px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;overflow:hidden">
-	<div style="flex:1;background:#404040;color:#999;font-size:10px;padding:4px 8px">25%</div>
-	<div style="flex:1;background:#808080;color:#333;font-size:10px;padding:4px 8px">50%</div>
-	<div style="flex:1;background:#bfbfbf;color:#333;font-size:10px;padding:4px 8px">75%</div>
-	<div style="flex:1;background:#ffffff;color:#333;font-size:10px;padding:4px 8px">100%</div>
-	<div style="flex:1;background:#000;color:#8a7da5;font-size:10px;padding:4px 8px">HDR→</div>
-</div>
+<div id="ladder"></div>
+<div id="hdrstate">checking HDR state…</div>
 <div id="info">
 	This canvas is WebGPU <code>rgba16float</code> + <code>toneMapping:'extended'</code> — true HDR. The shader writes
-	extended-sRGB (sRGB OETF applied in-shader, values may exceed 1.0).<br>
-	Calibration: the strip at the bottom of the canvas stores raw 0.25 / 0.5 / 0.75 / 1.0 / 2.0 — the first four
-	patches must match the CSS grays above; the 5th is HDR (brighter than white on an HDR display).<br>
-	Plugin patches <code>getContext('webgpu')</code> and <code>queue.submit</code> to enable readback of <code>getCurrentTexture()</code>.<br>
-	Click <b>HDR 📸</b> → <b>HDR→Save</b> to capture current HDR frame and save as Ultra HDR JPEG (SDR base + gain map derived from actual HDR ratio).<br>
-	Plugin must be loaded <b>before</b> WebGPU context is created — note script order.
+	<b>extended sRGB</b>: the sRGB OETF is applied in-shader and values may exceed 1.0.<br>
+	The strip along the bottom of the canvas is the calibration ladder above it. The first four patches store 0.25 /
+	0.5 / 0.75 / 1.0 and <b>must match the CSS grays</b> — if they do, the transfer function is right. The last five
+	store 1.25 … 4.0, which is 1.7× … 25× SDR white: on an HDR display they must get visibly brighter than the 1.0
+	patch, and they stop getting brighter once you pass the display headroom shown below.<br>
+	If <i>nothing</i> looks brighter than white, HDR is off before this demo even matters — open
+	<a href="hdr-selftest.html" style="color:#6bd5ff">hdr-selftest.html</a>, it isolates canvas config, tone mapping
+	mode and the plugin.<br>
+	Plugin patches <code>getContext('webgpu')</code> and <code>queue.submit</code> to enable readback of
+	<code>getCurrentTexture()</code>. Click <b>HDR 📸</b> → <b>HDR→Save</b> to save the current frame as an Ultra HDR
+	JPEG. Add <code>?hdrNoCopy=1</code> to the URL to keep the page's own swapchain usage flags (capture stops working,
+	presentation is untouched) — useful to prove the plugin is not what changed the picture.
 </div>
 
 <script>
@@ -49,6 +54,11 @@ var device, context, pipeline, uniBuf, bindGroup;
 var uniData = new Float32Array(8);
 var W=0,H=0,DPR=1;
 
+// calibration ladder: values written straight into the extended-sRGB swapchain.
+// 0…1 must match the CSS twins, >1 is HDR. linear multiple = extended sRGB EOTF.
+var LADDER = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+function srgbEotf(v){ return v <= 0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); }
+
 var wgsl = `
 struct U { exposure: f32, headroom: f32, time: f32, _pad: f32, width: f32, height: f32, _pad2: f32, _pad3: f32, }
 @group(0) @binding(0) var<uniform> u: U;
@@ -58,12 +68,27 @@ fn linearToSrgb(c: vec3f) -> vec3f {
   let hi = 1.055*pow(x, vec3f(1.0/2.4))-0.055;
   return select(hi, lo, x <= vec3f(0.0031308));
 }
+// SDR range passes through untouched, only the excess above 1.0 rolls off into
+// the headroom (continuous slope at 1.0, asymptote at H). A plain Reinhard here
+// dims the whole picture instead, which reads as "HDR stopped working".
+fn hdrKnee(peak: f32, H: f32) -> f32 {
+  if (H <= 1.0) { return min(peak, 1.0); }
+  if (peak <= 1.0) { return peak; }
+  let e = peak - 1.0;
+  let k = H - 1.0;
+  return 1.0 + k*e/(e + k);
+}
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   var p = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
   return vec4f(p[i],0,1);
 }
 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let uv = pos.xy / vec2f(max(u.width,1.0), max(u.height,1.0));
+  if (uv.y > 0.93) {
+    var ladder = array<f32,${LADDER.length}>(${LADDER.map(function(v){ return v.toFixed(4); }).join(', ')});
+    let idx = clamp(i32(uv.x*${LADDER.length}.0), 0, ${LADDER.length - 1});
+    return vec4f(vec3f(ladder[idx]), 1.0);
+  }
   let t = u.time*0.0005;
   var col = vec3f(0.0);
   for (var i=0;i<80;i=i+1){
@@ -76,30 +101,63 @@ fn linearToSrgb(c: vec3f) -> vec3f {
     let star = exp(-d*220.0) * (0.5+fract(sin(fi*78.233)*43758.5));
     let hue = fract(fi*0.37);
     let c = vec3f(0.7+0.3*sin(hue*6.28), 0.6+0.4*sin(hue*6.28+2.0), 0.8+0.2*sin(hue*6.28+4.0));
-    col += c * star * (1.0 + 3.0*exp(-d*700.0));
+    // the core is the HDR part of a star: a few pixels well above SDR white
+    col += c * star * (1.0 + 12.0*exp(-d*900.0));
   }
   let dcore = length(uv - vec2f(0.5));
   col += vec3f(1.0,0.86,0.58)*exp(-dcore*13.0)*0.8;
   col += vec3f(1.0,0.58,0.39)*exp(-dcore*26.0)*0.5;
+  col += vec3f(1.0,0.93,0.80)*exp(-dcore*90.0)*6.0;
   col = col * exp2(u.exposure) * 1.5;
   let peak = max(col.r, max(col.g, col.b));
-  let H = max(u.headroom, 0.5);
-  let mapped = (peak*H) * inverseSqrt(H*H + peak*peak);
-  let scale = select(1.0, mapped / max(peak,1e-6), peak>0.0);
-  col = col * scale;
-  var outc = linearToSrgb(col);
-  if (uv.y > 0.95) {
-    let q = uv.x * 5.0;
-    var v = 0.25;
-    if (q > 4.0) { v = 2.0; } else if (q > 3.0) { v = 1.0; } else if (q > 2.0) { v = 0.75; } else if (q > 1.0) { v = 0.5; }
-    outc = vec3f(v);
-  }
-  return vec4f(outc,1.0);
+  col = col * select(1.0, hdrKnee(peak, u.headroom)/max(peak,1e-6), peak > 1.0);
+  return vec4f(linearToSrgb(col), 1.0);
 }
 `;
 
+function buildLadder(){
+	var row = document.getElementById('ladder');
+	var css = ['#404040', '#808080', '#bfbfbf', '#ffffff'];
+	for (var i=0;i<LADDER.length;i++){
+		var v = LADDER[i];
+		var cell = document.createElement('div');
+		if (i < css.length) {
+			cell.style.background = css[i];
+			cell.style.color = i < 2 ? '#ddd' : '#333';
+			cell.textContent = v.toFixed(2);
+		} else {
+			cell.style.background = '#14101c';
+			cell.style.color = '#ff7ba8';
+			cell.textContent = v.toFixed(2) + '\n' + srgbEotf(v).toFixed(1) + '×';
+			cell.style.whiteSpace = 'pre';
+		}
+		row.appendChild(cell);
+	}
+}
+
+function displayHeadroom(){
+	var hr = window.screen ? screen.highDynamicRangeHeadroom : undefined;
+	return typeof hr === 'number' && hr > 0 ? hr : null;
+}
+function reportHDR(){
+	var el = document.getElementById('hdrstate');
+	var cfg = context && context.getConfiguration ? context.getConfiguration() : null;
+	var mode = cfg && cfg.toneMapping ? cfg.toneMapping.mode : 'unknown';
+	var hr = displayHeadroom();
+	var wide = matchMedia('(dynamic-range: high)').matches;
+	var ok = mode === 'extended' && wide;
+	el.innerHTML = (ok ? 'HDR path live' : '<b>HDR not available</b>') +
+		' · canvas ' + (cfg ? cfg.format : '?') +
+		' · toneMapping <b>' + mode + '</b>' +
+		' · display headroom <b>' + (hr === null ? 'not reported' : hr.toFixed(2) + '×') + '</b>' +
+		' · dynamic-range:high <b>' + (wide ? 'yes' : 'no') + '</b>' +
+		' · plugin ' + (window.HDRGainmapPlugin ? 'loaded' : 'absent') +
+		(hr !== null && headroom > hr ? ' — tone map targets ' + headroom.toFixed(2) + '×, above what the display can show' : '');
+}
+
 async function init() {
 	if (!navigator.gpu) { document.body.innerHTML += '<p>WebGPU not available</p>'; return; }
+	buildLadder();
 	var adapter = await navigator.gpu.requestAdapter();
 	device = await adapter.requestDevice();
 	context = canvas.getContext('webgpu');
@@ -110,6 +168,15 @@ async function init() {
 	pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module: mod, entryPoint: 'vs' }, fragment: { module: mod, entryPoint: 'fs', targets: [{ format: format }] }, primitive: { topology: 'triangle-list' } });
 	uniBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 	bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniBuf } }] });
+	// aim the tone map at what the display actually has, not at a guess
+	var hr = displayHeadroom();
+	if (hr !== null) {
+		headroom = Math.max(1, Math.min(8, hr));
+		document.getElementById('headroom').value = String(headroom);
+		document.getElementById('hrVal').textContent = headroom.toFixed(1) + '×';
+	}
+	reportHDR();
+	setInterval(reportHDR, 1000);
 	resize();
 	requestAnimationFrame(loop);
 }

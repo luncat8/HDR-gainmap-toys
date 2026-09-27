@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HDR canvas self-test</title>
+<script>
+// the plugin must patch getContext BEFORE the canvas gets its context, so it is
+// loaded here, synchronously, only when asked for: hdr-selftest.html?plugin=1
+if (new URLSearchParams(location.search).get('plugin') === '1') {
+	document.write('<scr' + 'ipt src="../hdr-gainmap-plugin.js"></scr' + 'ipt>');
+}
+</script>
+<style>
+	:root{color-scheme:dark}
+	body{margin:0;padding:20px;background:#050208;color:#f5f0ff;font:13px ui-monospace,system-ui;line-height:1.5}
+	h1{font-size:17px;margin:0 0 4px}
+	.wrap{max-width:900px}
+	.strip{display:flex;gap:0;overflow:hidden;border-radius:8px 8px 0 0}
+	.strip div{flex:1;font-size:10px;padding:5px 4px;text-align:center;white-space:pre;line-height:1.3}
+	canvas{display:block;width:100%;height:220px;border-radius:0 0 8px 8px;background:#000}
+	.row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0;font-size:12px}
+	label{display:flex;gap:6px;align-items:center;color:#b9aecd}
+	select{background:#14101c;color:#f5f0ff;border:1px solid #2a2338;border-radius:6px;padding:3px 6px;font:inherit}
+	#state{border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;font-size:12px;white-space:pre-wrap}
+	#state b{color:#ff7ba8}
+	p{color:#8a7da5;font-size:11.5px}
+	code{color:#6bd5ff}
+	a{color:#6bd5ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>HDR canvas self-test</h1>
+<p>One canvas, no scene, no gain maps: it answers “is this browser/display actually showing HDR, and is the
+transfer function what the demos assume?”. Every patch value below is written <b>straight into the swapchain</b>.</p>
+
+<div class="strip" id="twins"></div>
+<canvas id="probe"></canvas>
+
+<div class="row">
+	<label>tone mapping
+		<select id="tone"><option value="extended">extended</option><option value="standard">standard</option></select>
+	</label>
+	<label>color space
+		<select id="space"><option value="srgb">srgb</option><option value="display-p3">display-p3</option></select>
+	</label>
+	<label>swapchain usage
+		<select id="usage">
+			<option value="plain">RENDER_ATTACHMENT (default)</option>
+			<option value="copy">+ COPY_SRC | TEXTURE_BINDING (what the plugin forces)</option>
+		</select>
+	</label>
+	<label>format
+		<select id="format"><option value="rgba16float">rgba16float</option><option value="rgba8unorm">rgba8unorm</option></select>
+	</label>
+</div>
+
+<div id="state">configuring…</div>
+
+<p>
+<b>Test 1 — transfer function.</b> The four grey cells are CSS colors <code>#404040 #808080 #bfbfbf #ffffff</code>.
+The canvas patches right under them store 0.25 / 0.5 / 0.75 / 1.0. If each pair reads as one flat block, the canvas
+is <b>extended sRGB</b> (gamma-encoded, what every shader in this repo encodes for). If the canvas halves look much
+darker, the canvas is taking <b>linear</b> values and the shaders must not apply the sRGB OETF.<br>
+<b>Test 2 — HDR.</b> The five right-hand patches store 1.25 … 4.0, i.e. 1.7× … 25× SDR white. On an HDR display they
+must be clearly brighter than the 1.0 patch. They stop separating above the display headroom printed below — that is
+normal clipping, not a bug. Nothing brighter than white at all means the canvas is not on an HDR path: check
+<code>toneMapping</code> below, the OS HDR switch, and that the window is on the HDR monitor.<br>
+<b>Test 3 — the ramp</b> at the bottom of the canvas sweeps 0 → 4; the point where it stops getting brighter is the
+headroom your display really gives right now.<br>
+<b>Test 4 — the plugin.</b> Reload as <a href="hdr-selftest.html?plugin=1">?plugin=1</a> to load
+<code>hdr-gainmap-plugin.js</code> before the context exists, or flip “swapchain usage” above to the flags it forces.
+If either changes the picture, the plugin — not the shader math — is what altered the demos.
+</p>
+</div>
+
+<script>
+'use strict';
+// patch values written into the swapchain: 0…1 has CSS twins, >1 is the HDR ladder
+var LADDER = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+var CSS_TWINS = ['#404040', '#808080', '#bfbfbf', '#ffffff'];
+var RAMP_TOP = 4.0;
+function srgbEotf(v){ return v <= 0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); }
+
+var wgsl = `
+struct U { count: f32, rampTop: f32, width: f32, height: f32, };
+@group(0) @binding(0) var<uniform> u: U;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+  return vec4f(p[i], 0, 1);
+}
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let uv = pos.xy / vec2f(max(u.width,1.0), max(u.height,1.0));
+  var ladder = array<f32,${LADDER.length}>(${LADDER.map(function(v){ return v.toFixed(4); }).join(', ')});
+  if (uv.y < 0.74) {
+    let idx = clamp(i32(uv.x*u.count), 0, ${LADDER.length - 1});
+    return vec4f(vec3f(ladder[idx]), 1.0);
+  }
+  if (uv.y < 0.78) { return vec4f(vec3f(0.0), 1.0); }
+  return vec4f(vec3f(uv.x*u.rampTop), 1.0);
+}
+`;
+
+var canvas = document.getElementById('probe');
+var stateEl = document.getElementById('state');
+var device, context, pipeline, uniBuf, bindGroup, lastConfig = null;
+var uniData = new Float32Array(4);
+
+function buildTwins(){
+	var row = document.getElementById('twins');
+	for (var i = 0; i < LADDER.length; i++) {
+		var v = LADDER[i], cell = document.createElement('div');
+		if (i < CSS_TWINS.length) {
+			cell.style.background = CSS_TWINS[i];
+			cell.style.color = i < 2 ? '#dcd6e6' : '#26202f';
+			cell.textContent = 'CSS twin\n' + v.toFixed(2);
+		} else {
+			cell.style.background = '#14101c';
+			cell.style.color = '#ff7ba8';
+			cell.textContent = v.toFixed(2) + '\n' + srgbEotf(v).toFixed(1) + '× white';
+		}
+		row.appendChild(cell);
+	}
+}
+
+function pick(id){ return document.getElementById(id).value; }
+
+function configure(){
+	var usage = GPUTextureUsage.RENDER_ATTACHMENT;
+	if (pick('usage') === 'copy') usage |= GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING;
+	var config = {
+		device: device,
+		format: pick('format'),
+		colorSpace: pick('space'),
+		toneMapping: { mode: pick('tone') },
+		alphaMode: 'opaque',
+		usage: usage
+	};
+	context.configure(config);
+	lastConfig = config;
+	pipeline = device.createRenderPipeline({
+		layout: 'auto',
+		vertex: { module: device.createShaderModule({ code: wgsl }), entryPoint: 'vs' },
+		fragment: { module: device.createShaderModule({ code: wgsl }), entryPoint: 'fs', targets: [{ format: config.format }] },
+		primitive: { topology: 'triangle-list' }
+	});
+	bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniBuf } }] });
+	report();
+}
+
+function displayHeadroom(){
+	var hr = window.screen ? screen.highDynamicRangeHeadroom : undefined;
+	return typeof hr === 'number' && hr > 0 ? hr : null;
+}
+
+function report(){
+	var live = context.getConfiguration ? context.getConfiguration() : null;
+	var mode = live && live.toneMapping ? live.toneMapping.mode : 'unknown';
+	var hr = displayHeadroom();
+	var wide = matchMedia('(dynamic-range: high)').matches;
+	var askedUsage = lastConfig ? lastConfig.usage : 0;
+	var liveUsage = live && typeof live.usage === 'number' ? live.usage : askedUsage;
+	stateEl.innerHTML =
+		(mode === 'extended' && wide ? 'HDR path live' : '<b>HDR path NOT live</b>') + '\n' +
+		'requested       ' + (lastConfig ? lastConfig.format + ' / ' + lastConfig.colorSpace + ' / ' + lastConfig.toneMapping.mode : '—') + '\n' +
+		'browser reports ' + (live ? live.format + ' / ' + live.colorSpace + ' / ' + mode : 'getConfiguration() unavailable') +
+		(mode !== pick('tone') ? '   <b>← browser refused the requested tone mapping</b>' : '') + '\n' +
+		'usage bits      asked 0x' + askedUsage.toString(16) + ', live 0x' + liveUsage.toString(16) +
+		((liveUsage & GPUTextureUsage.COPY_SRC) ? '  (COPY_SRC on — capture possible)' : '  (no COPY_SRC — plugin capture impossible)') + '\n' +
+		'display         headroom ' + (hr === null ? 'not reported by this browser' : hr.toFixed(3) + '×') +
+		', dynamic-range:high ' + (wide ? 'yes' : 'no') + '\n' +
+		'plugin          ' + (window.HDRGainmapPlugin ? 'loaded (getContext patched)' : 'not loaded');
+}
+
+function resize(){
+	var dpr = Math.min(devicePixelRatio || 1, 2);
+	canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+	canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+}
+
+function frame(){
+	if (device && canvas.width > 0) {
+		uniData[0] = LADDER.length; uniData[1] = RAMP_TOP; uniData[2] = canvas.width; uniData[3] = canvas.height;
+		device.queue.writeBuffer(uniBuf, 0, uniData);
+		var enc = device.createCommandEncoder();
+		var pass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+		pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.draw(3); pass.end();
+		device.queue.submit([enc.finish()]);
+	}
+	requestAnimationFrame(frame);
+}
+
+async function init(){
+	buildTwins();
+	if (!navigator.gpu) { stateEl.textContent = 'WebGPU not available'; return; }
+	var adapter = await navigator.gpu.requestAdapter();
+	device = await adapter.requestDevice();
+	context = canvas.getContext('webgpu');
+	uniBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+	resize();
+	configure();
+	['tone', 'space', 'usage', 'format'].forEach(function(id){
+		document.getElementById(id).addEventListener('change', configure);
+	});
+	window.addEventListener('resize', function(){ resize(); configure(); });
+	setInterval(report, 1000);
+	requestAnimationFrame(frame);
+}
+init();
+</script>
+</body>
+</html>

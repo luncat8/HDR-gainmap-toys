@@ -155,6 +155,13 @@
 	// patch immediately so early getContext('webgpu') is caught
 	try { ensurePatch(); } catch (e) {}
 
+	// escape hatch: `?hdrNoCopy=1` keeps the page's own swapchain usage flags, so a
+	// suspected presentation difference can be A/B'd without removing the plugin.
+	function urlFlag(name) {
+		try { return new URLSearchParams(location.search).get(name) === '1'; } catch (e) { return false; }
+	}
+	var noSwapchainCopy = urlFlag('hdrNoCopy');
+
 	function wrapContext(canvas, ctx) {
 		if (ctx._hdrPatched) return;
 		ctx._hdrPatched = true;
@@ -164,7 +171,7 @@
 			// usage is RENDER_ATTACHMENT only, so copyTextureToBuffer would fail
 			// with "usage doesn't include CopySrc". OR the flag in silently.
 			try {
-				if (typeof GPUTextureUsage !== 'undefined') {
+				if (typeof GPUTextureUsage !== 'undefined' && !noSwapchainCopy) {
 					var need = GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING;
 					if (typeof config.usage === 'number') config.usage = config.usage | need;
 					else config.usage = GPUTextureUsage.RENDER_ATTACHMENT | need;
@@ -499,6 +506,9 @@ fn weight() -> f32 {
 		lutMin: 0, lutMax: 1,
 		view: 'hdr'
 	};
+	// the curve editor draws as soon as the UI is built — before any capture —
+	// so the curve and its LUT must exist from the start, not from first capture.
+	setCurve(rampPoints(state.params.threshold));
 	var gpuProc = null, srcTex = null, sdrTex = null, gainTex = null, hdrTex = null;
 	var gainW = 0, gainH = 0, ubo = null, samp = null, gainPipe = null, applyPipe = null, presentPipe = null, histPipe = null, hdrToGainPipe = null;
 	var bgTonemap = null, bgGain = null, bgApply = null, bgPresent = null, bgGainView = null, bgHist = null, bgBase = null, bgLayout = null;
@@ -726,8 +736,7 @@ fn weight() -> f32 {
 			state.srcW = bitmap.width || canvas.width;
 			state.srcH = bitmap.height || canvas.height;
 			state.hdrData = null;
-			state.curvePoints = rampPoints(state.params.threshold);
-			refreshLUT();
+			setCurve(rampPoints(state.params.threshold));
 			await initProcessorForSource(bitmap);
 			editorEl.classList.remove('hidden');
 			panel.classList.remove('hidden');
@@ -751,8 +760,7 @@ fn weight() -> f32 {
 				state.sourceCanvas = canvas;
 				state.sourceType = 'sdr';
 				state.srcW = bitmap.width; state.srcH = bitmap.height;
-				state.curvePoints = rampPoints(state.params.threshold);
-				refreshLUT();
+				setCurve(rampPoints(state.params.threshold));
 				await initProcessorForSource(bitmap);
 				editorEl.classList.remove('hidden');
 				panel.classList.remove('hidden');
@@ -770,8 +778,7 @@ fn weight() -> f32 {
 			state.srcW = data.width;
 			state.srcH = data.height;
 			state.hdrData = data;
-			state.curvePoints = rampPoints(state.params.threshold);
-			refreshLUT();
+			setCurve(rampPoints(state.params.threshold));
 			await initProcessorForHDR(data);
 			editorEl.classList.remove('hidden');
 			panel.classList.remove('hidden');
@@ -1091,13 +1098,18 @@ fn weight() -> f32 {
 		}
 		slider('shadow lift', -2, 1, 0.05, p.shadowLift, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.shadowLift = v; requestRender(); }, true);
 		slider('highlight gain', 0, 4, 0.05, p.highlightGain, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.highlightGain = v; requestRender(); }, true);
-		slider('threshold', 0.05, 1, 0.01, p.threshold, function (v) { return v.toFixed(2); }, function (v) { p.threshold = v; state.curvePoints = rampPoints(v); refreshLUT(); if (curveEditor) curveEditor.draw(); requestRender(); }, true);
+		slider('threshold', 0.05, 1, 0.01, p.threshold, function (v) { return v.toFixed(2); }, function (v) { p.threshold = v; setCurve(rampPoints(v)); if (curveEditor) curveEditor.draw(); requestRender(); }, true);
 		slider('peak nits', 100, 4000, 10, p.peakNits, function (v) { return v.toFixed(0); }, function (v) { p.peakNits = v; requestRender(); }, true);
 		slider('SDR white', 80, 400, 1, p.sdrWhite, function (v) { return v.toFixed(0); }, function (v) { p.sdrWhite = v; requestRender(); }, true);
 		slider('gain scale', 1, 8, 1, p.gainScale, function (v) { return '1:' + v; }, function (v) { p.gainScale = v; queueRebuild(); });
 		slider('exposure', -3, 3, 0.05, p.exposure, function (v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }, function (v) { p.exposure = v; requestRender(); });
 		slider('headroom', 1, 16, 0.25, p.headroom, function (v) { return v.toFixed(2) + '×'; }, function (v) { p.headroom = v; requestRender(); });
 		updateModeUI();
+	}
+
+	function setCurve(points) {
+		state.curvePoints = points;
+		refreshLUT();
 	}
 
 	function refreshLUT() {

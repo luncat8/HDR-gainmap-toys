@@ -133,8 +133,15 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
   Dawn from source. don't retry these.
 * WGSL syntax + uniform layout: `npm i wgsl_reflect`, then
   `new WgslReflect(code)` — catches typos and verifies struct offsets.
+  `node tests/node/wgsl.check.mjs` does this for every shader literal in the repo
+  (it expands the `${...}` interpolations from a small table and skips itself if
+  wgsl_reflect is not installed; `WGSL_REFLECT=/path/to/wgsl_reflect.module.js`
+  points it at a copy outside the repo).
 * app wiring: `tests/node/app.smoke.js` stubs document + WebGPU and drives a
-  real save → parse → verify cycle.
+  real save → parse → verify cycle. `tests/node/plugin.smoke.js` does the same for
+  the drop-in plugin (fake DOM with a tiny innerHTML parser, patched
+  `HTMLCanvasElement.prototype.getContext`, a stub swapchain readback) and asserts
+  the status line, so a broken capture path fails in CI instead of in a browser.
 * `exiftool` (independent MPF/XMP parser) runs from a tarball without root:
   `perl exiftool -G1 -n file.jpg`. tarball from the GitHub release mirror
   (`github.com/exiftool/exiftool/archive/refs/tags/…`) — exiftool.org is blocked.
@@ -153,6 +160,38 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
 * detection: scan `document.querySelectorAll('canvas')` every 2s + `MutationObserver` (skipping the plugin's own nodes); per-canvas type: `webgpuMap` format (`rgba16float` = hdr) else recorded `_hdrCtxType`, never a live `getContext` call. Skip `drawImage` thumbnails for any `webgpu*` canvas.
 * **swapchain transfer function (calibration root cause).** `rgba16float` + `colorSpace:'srgb'` + `toneMapping:'extended'` holds *extended-sRGB* (OETF-encoded, range past 1.0): the spec interprets stored values in the canvas color space and the display applies the EOTF, so the shader must encode (`linearToSrgb`, extended past 1) — wgpu docs' "ExtendedSrgb" row and ccameron-chromium/webgpu-hdr ("converted to the color space of the screen") agree. Writing linear instead shows crushed mids + nuclear highlights with no error; starfields hide it (blacks stay black), which is why the upstream galaxy demo's "direct linear HDR values" comment is wrong. All repo demos now encode; `examples/hdr-canvas-demo.html` has a calibration strip (raw 0.25/0.5/0.75/1.0/2.0 patches + CSS twins that must match).
 * **HDR editor pipeline (plugin).** Readback bytes are decoded extended-sRGB → linear once (`srgbToLinearData`), then: `fs_tonemap` (exposure × peak-preserving compress `H/sqrt(H²+peak²)` + clamp + sRGB encode → `sdrTex`) → `fs_hdr_to_gain` (exposure-aware HDR vs decoded base → recovery normalized by CPU-scanned content range) → `fs_apply` (exact decoder formula with weight from the headroom slider) → present. Preview = "this file on an H× display", so the headroom slider visibly dims/boosts; capacity metadata mirrors the content range (like Pixel files), peak/sdrWhite sliders are SDR-mode-only. Exposure is baked in tonemap/gain, so present runs as a second submit with exposure 0 (one UBO can't hold both). CPU save (`encodeFromHDR`) uses the identical formula with block-averaged gain, so preview == file.
+* **UI state must exist before the UI is built.** `ensureProcessorUI()` builds the
+  controls and the curve editor on the *first* capture, and the curve editor draws
+  immediately — with `state.curvePoints` still `null` it threw
+  `Cannot read properties of null (reading 'length')` inside `tangents()`, so the
+  first click on either capture button always failed (later clicks "worked" but the
+  curve editor was never initialised). Seed the curve + LUT at module scope
+  (`setCurve(rampPoints(threshold))`), never on first capture.
+  `tests/node/plugin.smoke.js` drives `captureSDR` / `captureHDR` against a stub DOM
+  + WebGPU and reproduces exactly that stack trace when the seed is removed.
+* **"HDR stopped working" triage.** `examples/hdr-selftest.html` writes fixed values
+  (0.25…4.0) straight into the swapchain, next to CSS grey twins: patches vs twins =
+  transfer function check, 1.25…4.0 vs 1.0 = is-this-display-HDR check, and the 0→4
+  ramp shows where the display clips. It also prints `getConfiguration()`, the usage
+  bits, `screen.highDynamicRangeHeadroom` and `(dynamic-range: high)`. Toggles cover
+  tone mapping mode, color space, format and the exact usage flags the plugin forces;
+  `?plugin=1` loads the plugin before the context exists. So "plugin vs shader vs
+  display" is answered by looking, not guessing. In the demos the same A/B is
+  `?hdrNoCopy=1` (plugin skips its `COPY_SRC | TEXTURE_BINDING` OR-in; capture dies,
+  presentation is untouched).
+* **tone mapping must not eat the SDR range.** `mapped = peak*H/sqrt(H²+peak²)`
+  (plain Reinhard against the headroom) scales *every* pixel, so the whole picture
+  dims a few percent and highlights never reach `H`; combined with the OETF fix it
+  reads as "HDR is gone". Use a knee that is the identity below 1.0 and rolls only
+  the excess into the headroom: `1 + (H-1)·e/(e + (H-1))`, `e = peak-1` (slope 1 at
+  the join, asymptote `H`). Both demos use it now.
+* **HDR needs content above 1.0, not a brighter tone map.** Once the OETF is applied
+  correctly, a scene tuned for "linear straight into the swapchain" has almost
+  nothing over SDR white (the old bug inflated everything: writing linear `v` used to
+  display as `v^2.4`, so 4.0 became ~27×). Put the HDR where it belongs — a small
+  core per star, a few pixels wide, several × SDR white — and keep the halo/sky
+  inside SDR. The demos also default their tone-map target to
+  `screen.highDynamicRangeHeadroom` instead of a hardcoded 4×.
 * editor UI: sliders flagged `sdrOnly` (shadow/highlight/threshold/peak/sdrWhite) and the curve hide in HDR mode; HDR/SDR-base/gain view switcher works in both modes; slider input is rAF-coalesced (`requestRender`) and gain-scale rebuilds debounced.
 * SDR snapshot: `createImageBitmap(canvas)` → offscreen 2D canvas `getImageData` → `queue.writeTexture` with 256-padded `bytesPerRow`. Avoids color-management surprises (same as `gpu.js`).
 * SDR→HDR authoring reuses 0.1 tone model: curve `Y_sdr → t`, `log2gain = shadowLift + t*(highlightGain-shadowLift)`, `hdr = sdr * exp2(log2gain)`, `recovery = t`. No division by sdr, so no log(0).
