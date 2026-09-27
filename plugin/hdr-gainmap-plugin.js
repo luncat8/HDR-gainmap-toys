@@ -161,6 +161,9 @@
 		try { return new URLSearchParams(location.search).get(name) === '1'; } catch (e) { return false; }
 	}
 	var noSwapchainCopy = urlFlag('hdrNoCopy');
+	// extended-sRGB swapchains want the OETF in-shader; `?linear=1` presents linear
+	// light instead, to A/B a swapchain that turns out to carry a linear signal.
+	var outputEncode = !urlFlag('linear');
 
 	function wrapContext(canvas, ctx) {
 		if (ctx._hdrPatched) return;
@@ -432,7 +435,13 @@ fn weight() -> f32 {
   let sdr = srgbToLinear(textureSampleLevel(tex0,samp,in.uv,0.0).rgb); let rec = textureSampleLevel(tex1,samp,in.uv,0.0).r; let logBoost = mix(P.a.x, P.a.y, rec); let g = exp2(logBoost*weight()); return vec4f(max(sdr*g, vec3f(0.0)), 1.0);
 }
 @fragment fn fs_present(in : VSOut) -> @location(0) vec4f {
-  let c = textureSampleLevel(tex0,samp,in.uv,0.0); if (P.b.z > 2.5) { return vec4f(c.rgb, 1.0); } let scale = exp2(P.b.x); let rgb = select(c.rgb, vec3f(c.r), P.b.z > 1.5); return vec4f(linearToSrgb(rgb*scale), 1.0);
+  // P.c.z selects the swapchain transfer function: 1 = extended sRGB (encode
+  // here, display applies the EOTF), 0 = linear swapchain (write linear light).
+  let encode = P.c.z > 0.5;
+  let c = textureSampleLevel(tex0,samp,in.uv,0.0);
+  if (P.b.z > 2.5) { return vec4f(select(srgbToLinear(c.rgb), c.rgb, encode), 1.0); }
+  let scale = exp2(P.b.x); let rgb = select(c.rgb, vec3f(c.r), P.b.z > 1.5) * scale;
+  return vec4f(select(max(rgb, vec3f(0.0)), linearToSrgb(rgb), encode), 1.0);
 }
 @fragment fn fs_hist(in : VSOut) -> @location(0) vec4f {
   let a = srgbToLinear(textureSampleLevel(tex0,samp,in.uv,0.0).rgb); let b = textureSampleLevel(tex1,samp,in.uv,0.0).rgb; return vec4f(log2(max(luma(a),1e-6)), log2(max(luma(b),1e-6)), 0.0, 1.0);
@@ -960,7 +969,8 @@ fn weight() -> f32 {
 		var proc = gpuProc;
 		proc.params[0] = p.rangeMin; proc.params[1] = p.rangeMax; proc.params[2] = p.capacityMin; proc.params[3] = p.capacityMax;
 		proc.params[4] = p.exposure; proc.params[5] = Math.log2(p.headroom); proc.params[6] = p.mode; proc.params[7] = p.gainScale;
-		proc.params[8] = state.srcW; proc.params[9] = state.srcH; proc.params[10] = gainW; proc.params[11] = gainH;
+		proc.params[8] = state.srcW; proc.params[9] = state.srcH;
+		proc.params[10] = outputEncode ? 1 : 0; proc.params[11] = 0;
 		proc.params.set(state.lut, 12);
 		proc.device.queue.writeBuffer(proc.ubo, 0, proc.params);
 	}

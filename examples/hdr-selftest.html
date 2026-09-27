@@ -15,14 +15,20 @@ if (new URLSearchParams(location.search).get('plugin') === '1') {
 	:root{color-scheme:dark}
 	body{margin:0;padding:20px;background:#050208;color:#f5f0ff;font:13px ui-monospace,system-ui;line-height:1.5}
 	h1{font-size:17px;margin:0 0 4px}
+	h2{font-size:13px;margin:22px 0 6px;color:#ff7ba8;letter-spacing:0.08em;text-transform:uppercase}
 	.wrap{max-width:900px}
+	.bars{display:flex;gap:0}
+	.bars div{font-size:10px;text-align:center;padding:0;line-height:22px;height:22px;white-space:pre}
+	.labels div{flex:1;font-size:10px;text-align:center;color:#8a7da5;line-height:1.35;padding:3px 2px;white-space:pre}
+	canvas{display:block;width:100%;background:#000}
+	#tf{height:120px}
+	#probe{height:200px;border-radius:0 0 8px 8px}
 	.strip{display:flex;gap:0;overflow:hidden;border-radius:8px 8px 0 0}
 	.strip div{flex:1;font-size:10px;padding:5px 4px;text-align:center;white-space:pre;line-height:1.3}
-	canvas{display:block;width:100%;height:220px;border-radius:0 0 8px 8px;background:#000}
 	.row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0;font-size:12px}
 	label{display:flex;gap:6px;align-items:center;color:#b9aecd}
 	select{background:#14101c;color:#f5f0ff;border:1px solid #2a2338;border-radius:6px;padding:3px 6px;font:inherit}
-	#state{border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;font-size:12px;white-space:pre-wrap}
+	#state{border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:8px 10px;font-size:12px;white-space:pre-wrap;margin-top:14px}
 	#state b{color:#ff7ba8}
 	p{color:#8a7da5;font-size:11.5px}
 	code{color:#6bd5ff}
@@ -32,9 +38,25 @@ if (new URLSearchParams(location.search).get('plugin') === '1') {
 <body>
 <div class="wrap">
 <h1>HDR canvas self-test</h1>
-<p>One canvas, no scene, no gain maps: it answers “is this browser/display actually showing HDR, and is the
-transfer function what the demos assume?”. Every patch value below is written <b>straight into the swapchain</b>.</p>
+<p>No scene, no gain maps: every patch value below is written <b>straight into the swapchain</b>, so this page only
+measures the canvas and the display.</p>
 
+<h2>Test 1 — which number does the canvas want?</h2>
+<p>Three grey surrounds (CSS <code>#404040 #808080 #bfbfbf</code>) wrap a pair of canvas patches each.
+<b>A</b> holds the sRGB-encoded number, <b>B</b> holds the same colour as a linear number. Exactly one of them should
+vanish into its surround — squint, or look from a step back.<br>
+<b>A vanishes</b> → the swapchain is extended sRGB (gamma-encoded): shaders must apply the sRGB OETF.<br>
+<b>B vanishes</b> → the swapchain is linear (scRGB-style): shaders must write linear light and <i>not</i> encode.</p>
+<div class="bars" id="tfTop"></div>
+<canvas id="tf"></canvas>
+<div class="bars" id="tfBot"></div>
+<div class="bars labels" id="tfLabels"></div>
+
+<h2>Test 2 — is the display actually HDR?</h2>
+<p>Patches 1.25 … 4.0 are written raw. Under the encoded reading they are 1.7× … 25× SDR white, under the linear
+reading 1.25× … 4×; either way they must be visibly brighter than the 1.0 patch, and they stop separating once you
+pass the display headroom. The strip at the bottom of the canvas sweeps 0 → 4: where it stops brightening is the
+headroom you really have.</p>
 <div class="strip" id="twins"></div>
 <canvas id="probe"></canvas>
 
@@ -58,32 +80,34 @@ transfer function what the demos assume?”. Every patch value below is written 
 
 <div id="state">configuring…</div>
 
-<p>
-<b>Test 1 — transfer function.</b> The four grey cells are CSS colors <code>#404040 #808080 #bfbfbf #ffffff</code>.
-The canvas patches right under them store 0.25 / 0.5 / 0.75 / 1.0. If each pair reads as one flat block, the canvas
-is <b>extended sRGB</b> (gamma-encoded, what every shader in this repo encodes for). If the canvas halves look much
-darker, the canvas is taking <b>linear</b> values and the shaders must not apply the sRGB OETF.<br>
-<b>Test 2 — HDR.</b> The five right-hand patches store 1.25 … 4.0, i.e. 1.7× … 25× SDR white. On an HDR display they
-must be clearly brighter than the 1.0 patch. They stop separating above the display headroom printed below — that is
-normal clipping, not a bug. Nothing brighter than white at all means the canvas is not on an HDR path: check
-<code>toneMapping</code> below, the OS HDR switch, and that the window is on the HDR monitor.<br>
-<b>Test 3 — the ramp</b> at the bottom of the canvas sweeps 0 → 4; the point where it stops getting brighter is the
-headroom your display really gives right now.<br>
-<b>Test 4 — the plugin.</b> Reload as <a href="hdr-selftest.html?plugin=1">?plugin=1</a> to load
-<code>hdr-gainmap-plugin.js</code> before the context exists, or flip “swapchain usage” above to the flags it forces.
+<p><b>Test 3 — the plugin.</b> Reload as <a href="hdr-selftest.html?plugin=1">?plugin=1</a> to load
+<code>hdr-gainmap-plugin.js</code> before the context exists, or flip “swapchain usage” to the flags it forces.
 If either changes the picture, the plugin — not the shader math — is what altered the demos.
-</p>
+The demos take <code>?hdrNoCopy=1</code> (plugin keeps the page's own usage flags) and <code>?linear=1</code>
+(present without the sRGB OETF) for the same kind of A/B.</p>
 </div>
 
 <script>
 'use strict';
-// patch values written into the swapchain: 0…1 has CSS twins, >1 is the HDR ladder
+// Test 1: per grey level, A = the sRGB-encoded number, B = the same colour linear.
+var TF_LEVELS = [0.25, 0.5, 0.75];
+var CSS_HEX = ['#404040', '#808080', '#bfbfbf'];
+// Test 2: SDR reference + HDR ladder, written raw
 var LADDER = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 var CSS_TWINS = ['#404040', '#808080', '#bfbfbf', '#ffffff'];
 var RAMP_TOP = 4.0;
+
 function srgbEotf(v){ return v <= 0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); }
 
-var wgsl = `
+var TF_VALUES = [];
+for (var li = 0; li < TF_LEVELS.length; li++) { TF_VALUES.push(TF_LEVELS[li]); TF_VALUES.push(srgbEotf(TF_LEVELS[li])); }
+
+function patchShader(values, withRamp){
+	// the ramp lives in the bottom fifth of the HDR canvas only
+	var rampSrc = withRamp
+		? '\n  if (uv.y >= 0.80) {\n    if (uv.y < 0.84) { return vec4f(vec3f(0.0), 1.0); }\n    return vec4f(vec3f(uv.x*u.rampTop), 1.0);\n  }'
+		: '';
+	return `
 struct U { count: f32, rampTop: f32, width: f32, height: f32, };
 @group(0) @binding(0) var<uniform> u: U;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
@@ -92,22 +116,38 @@ struct U { count: f32, rampTop: f32, width: f32, height: f32, };
 }
 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let uv = pos.xy / vec2f(max(u.width,1.0), max(u.height,1.0));
-  var ladder = array<f32,${LADDER.length}>(${LADDER.map(function(v){ return v.toFixed(4); }).join(', ')});
-  if (uv.y < 0.74) {
-    let idx = clamp(i32(uv.x*u.count), 0, ${LADDER.length - 1});
-    return vec4f(vec3f(ladder[idx]), 1.0);
-  }
-  if (uv.y < 0.78) { return vec4f(vec3f(0.0), 1.0); }
-  return vec4f(vec3f(uv.x*u.rampTop), 1.0);
+  var patches = array<f32,${values.length}>(${values.map(function(v){ return v.toFixed(5); }).join(', ')});
+  let idx = clamp(i32(uv.x*u.count), 0, ${values.length - 1});
+  ${rampSrc}
+  return vec4f(vec3f(patches[idx]), 1.0);
 }
 `;
+}
 
-var canvas = document.getElementById('probe');
 var stateEl = document.getElementById('state');
-var device, context, pipeline, uniBuf, bindGroup, lastConfig = null;
-var uniData = new Float32Array(4);
+var device, context = {}, lastConfig = null;
+var views = [];   // one entry per canvas: { canvas, values, withRamp, pipeline, bindGroup, context }
+var uniBuf, uniData = new Float32Array(4);
 
-function buildTwins(){
+function buildTest1Chrome(){
+	var top = document.getElementById('tfTop'), bot = document.getElementById('tfBot'), lab = document.getElementById('tfLabels');
+	for (var i = 0; i < TF_LEVELS.length; i++) {
+		[top, bot].forEach(function (row) {
+			var bar = document.createElement('div');
+			bar.style.flex = '2';
+			bar.style.background = CSS_HEX[i];
+			bar.style.color = i < 2 ? '#dcd6e6' : '#26202f';
+			bar.textContent = row === top ? 'CSS ' + CSS_HEX[i] : '';
+			row.appendChild(bar);
+		});
+		var a = document.createElement('div'), b = document.createElement('div');
+		a.textContent = 'A ' + TF_LEVELS[i].toFixed(3) + '\nencoded';
+		b.textContent = 'B ' + srgbEotf(TF_LEVELS[i]).toFixed(3) + '\nlinear';
+		lab.appendChild(a); lab.appendChild(b);
+	}
+}
+
+function buildTest2Chrome(){
 	var row = document.getElementById('twins');
 	for (var i = 0; i < LADDER.length; i++) {
 		var v = LADDER[i], cell = document.createElement('div');
@@ -118,7 +158,7 @@ function buildTwins(){
 		} else {
 			cell.style.background = '#14101c';
 			cell.style.color = '#ff7ba8';
-			cell.textContent = v.toFixed(2) + '\n' + srgbEotf(v).toFixed(1) + '× white';
+			cell.textContent = v.toFixed(2) + '\n' + srgbEotf(v).toFixed(1) + '× if encoded';
 		}
 		row.appendChild(cell);
 	}
@@ -129,23 +169,20 @@ function pick(id){ return document.getElementById(id).value; }
 function configure(){
 	var usage = GPUTextureUsage.RENDER_ATTACHMENT;
 	if (pick('usage') === 'copy') usage |= GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING;
-	var config = {
-		device: device,
-		format: pick('format'),
-		colorSpace: pick('space'),
-		toneMapping: { mode: pick('tone') },
-		alphaMode: 'opaque',
-		usage: usage
-	};
-	context.configure(config);
-	lastConfig = config;
-	pipeline = device.createRenderPipeline({
-		layout: 'auto',
-		vertex: { module: device.createShaderModule({ code: wgsl }), entryPoint: 'vs' },
-		fragment: { module: device.createShaderModule({ code: wgsl }), entryPoint: 'fs', targets: [{ format: config.format }] },
-		primitive: { topology: 'triangle-list' }
-	});
-	bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniBuf } }] });
+	var format = pick('format');
+	lastConfig = { format: format, colorSpace: pick('space'), toneMapping: { mode: pick('tone') }, usage: usage };
+	for (var i = 0; i < views.length; i++) {
+		var v = views[i];
+		v.context.configure({ device: device, format: format, colorSpace: lastConfig.colorSpace, toneMapping: { mode: lastConfig.toneMapping.mode }, alphaMode: 'opaque', usage: usage });
+		var mod = device.createShaderModule({ code: patchShader(v.values, v.withRamp) });
+		v.pipeline = device.createRenderPipeline({
+			layout: 'auto',
+			vertex: { module: mod, entryPoint: 'vs' },
+			fragment: { module: mod, entryPoint: 'fs', targets: [{ format: format }] },
+			primitive: { topology: 'triangle-list' }
+		});
+		v.bindGroup = device.createBindGroup({ layout: v.pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniBuf } }] });
+	}
 	report();
 }
 
@@ -155,7 +192,8 @@ function displayHeadroom(){
 }
 
 function report(){
-	var live = context.getConfiguration ? context.getConfiguration() : null;
+	var probe = views[views.length - 1];
+	var live = probe.context.getConfiguration ? probe.context.getConfiguration() : null;
 	var mode = live && live.toneMapping ? live.toneMapping.mode : 'unknown';
 	var hr = displayHeadroom();
 	var wide = matchMedia('(dynamic-range: high)').matches;
@@ -175,29 +213,42 @@ function report(){
 
 function resize(){
 	var dpr = Math.min(devicePixelRatio || 1, 2);
-	canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
-	canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+	for (var i = 0; i < views.length; i++) {
+		var c = views[i].canvas;
+		c.width = Math.max(1, Math.round(c.clientWidth * dpr));
+		c.height = Math.max(1, Math.round(c.clientHeight * dpr));
+	}
 }
 
 function frame(){
-	if (device && canvas.width > 0) {
-		uniData[0] = LADDER.length; uniData[1] = RAMP_TOP; uniData[2] = canvas.width; uniData[3] = canvas.height;
-		device.queue.writeBuffer(uniBuf, 0, uniData);
+	if (device) {
 		var enc = device.createCommandEncoder();
-		var pass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
-		pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.draw(3); pass.end();
-		device.queue.submit([enc.finish()]);
+		for (var i = 0; i < views.length; i++) {
+			var v = views[i];
+			if (!v.pipeline || v.canvas.width === 0) continue;
+			uniData[0] = v.values.length; uniData[1] = RAMP_TOP; uniData[2] = v.canvas.width; uniData[3] = v.canvas.height;
+			device.queue.writeBuffer(uniBuf, 0, uniData);
+			var pass = enc.beginRenderPass({ colorAttachments: [{ view: v.context.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+			pass.setPipeline(v.pipeline); pass.setBindGroup(0, v.bindGroup); pass.draw(3); pass.end();
+			device.queue.submit([enc.finish()]);
+			enc = device.createCommandEncoder();
+		}
 	}
 	requestAnimationFrame(frame);
 }
 
 async function init(){
-	buildTwins();
+	buildTest1Chrome();
+	buildTest2Chrome();
 	if (!navigator.gpu) { stateEl.textContent = 'WebGPU not available'; return; }
 	var adapter = await navigator.gpu.requestAdapter();
 	device = await adapter.requestDevice();
-	context = canvas.getContext('webgpu');
 	uniBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+	var tf = document.getElementById('tf'), probe = document.getElementById('probe');
+	views = [
+		{ canvas: tf, context: tf.getContext('webgpu'), values: TF_VALUES, withRamp: false },
+		{ canvas: probe, context: probe.getContext('webgpu'), values: LADDER, withRamp: true }
+	];
 	resize();
 	configure();
 	['tone', 'space', 'usage', 'format'].forEach(function(id){

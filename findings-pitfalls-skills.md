@@ -169,6 +169,15 @@ SOI APP1:xmp(hdrgm)              <gain map jpeg>             EOI
   (`setCurve(rampPoints(threshold))`), never on first capture.
   `tests/node/plugin.smoke.js` drives `captureSDR` / `captureHDR` against a stub DOM
   + WebGPU and reproduces exactly that stack trace when the seed is removed.
+* **transfer function: measure, never assume.** "Do these two greys match?" is a
+  useless question (observers disagree about which side is darker). Ask instead
+  *which of two candidates vanishes*: put the CSS grey as a surround and draw two
+  canvas patches inside it — `A = 0.5` (right if the swapchain is gamma-encoded)
+  and `B = 0.216` (right if it is linear). Exactly one merges with the surround.
+  `examples/hdr-selftest.html` Test 1 does this for 0.25 / 0.5 / 0.75. Until it is
+  settled on real hardware, both demos and the plugin take `?linear=1` to present
+  linear light instead of extended sRGB (the plugin also has a checkbox-free
+  uniform, `P.c.z`), so flipping the assumption is one URL away, not a rewrite.
 * **"HDR stopped working" triage.** `examples/hdr-selftest.html` writes fixed values
   (0.25…4.0) straight into the swapchain, next to CSS grey twins: patches vs twins =
   transfer function check, 1.25…4.0 vs 1.0 = is-this-display-HDR check, and the 0→4

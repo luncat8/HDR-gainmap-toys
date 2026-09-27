@@ -23,7 +23,7 @@ if (!WgslReflect) {
 // values the shader templates interpolate, per file
 const scope = {
 	'examples/hdr-canvas-demo.html': { LADDER: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] },
-	'examples/hdr-selftest.html': { LADDER: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] },
+	'examples/hdr-selftest.html': { values: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0], rampSrc: 'if (uv.y >= 0.8) { return vec4f(vec3f(uv.x*u.rampTop), 1.0); }' },
 	'hdr-gainmap-plugin.js': { LUT_SAMPLES: 64 }
 };
 
