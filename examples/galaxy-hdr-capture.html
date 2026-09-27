@@ -32,7 +32,7 @@
 const TAU = Math.PI*2;
 const canvas = document.getElementById('sky');
 const N_DISK = 6000, N_BULGE = 1000;
-const CAM_DIST = 12.0, V0=1.8, SCENE_GAIN=1.5;
+const CAM_DIST = 12.0, V0=1.8, SCENE_GAIN=0.8;
 let speed=1.0, ecc_max=0.2, Omega_p=0.15, pitch_deg=15, num_arms=2, pattern_phase=0;
 let rotZ=0, tilt=1.2, zoom=1, tRotZ=0, tTilt=1.2, tZoom=1;
 let exposure=0, saturation=1, hdrHeadroom=4;
@@ -86,17 +86,18 @@ struct QuadVertexOutput { @builtin(position) position: vec4<f32>, @location(0) u
 struct BgUniforms { resolution: vec2<f32>, glowR:f32, mode:f32, fade:f32, _pad0:f32, _pad1:f32, _pad2:f32, };
 @group(0) @binding(0) var<uniform> uBg: BgUniforms; @group(0) @binding(1) var uPrevTex: texture_2d<f32>; @group(0) @binding(2) var uSampler: sampler;
 @fragment fn fs_bg(in:QuadVertexOutput) -> @location(0) vec4<f32> {
-  if(uBg.mode<0.5){ let pix=in.uv*uBg.resolution; let c=uBg.resolution*0.5; let d1=length(pix-c)/max(max(uBg.resolution.x,uBg.resolution.y),1.0); let bg=mix(vec3<f32>(0.04,0.02,0.07), vec3<f32>(0.008,0.004,0.03), clamp(d1,0,1)); return vec4<f32>(bg,1.0); } else { let prev=textureSample(uPrevTex,uSampler,in.uv).rgb; return vec4<f32>(prev*uBg.fade,1.0); }
+  if(uBg.mode<0.5){ let pix=in.uv*uBg.resolution; let c=uBg.resolution*0.5; let d1=length(pix-c)/max(max(uBg.resolution.x,uBg.resolution.y),1.0); let bg=mix(vec3<f32>(0.002,0.001,0.0035), vec3<f32>(0.0004,0.0002,0.0015), clamp(d1,0,1)); return vec4<f32>(bg,1.0); } else { let prev=textureSample(uPrevTex,uSampler,in.uv).rgb; return vec4<f32>(prev*uBg.fade,1.0); }
 }
 `;
 const WGSL_PRESENT=`
 struct VSOut { @builtin(position) position: vec4f, @location(0) uv: vec2f, };
 @vertex fn vs_quad(@builtin(vertex_index) vi:u32) -> VSOut { var positions=array<vec2f,3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3)); var out:VSOut; out.position=vec4f(positions[vi],0,1); out.uv=positions[vi]*vec2f(0.5,-0.5)+vec2f(0.5,0.5); return out; }
 struct PresentUniforms { exposure:f32, saturation:f32, headroom:f32, _pad:f32, };
+fn linearToSrgb(c: vec3f) -> vec3f { let x=max(c, vec3f(0.0)); let lo=x*12.92; let hi=1.055*pow(x, vec3f(1.0/2.4))-0.055; return select(hi, lo, x <= vec3f(0.0031308)); }
 @group(0) @binding(0) var<uniform> uGrad: PresentUniforms; @group(0) @binding(1) var uSceneTex: texture_2d<f32>; @group(0) @binding(2) var uSampler: sampler;
 @fragment fn fs_present(in:VSOut) -> @location(0) vec4f {
   let raw=textureSample(uSceneTex,uSampler,in.uv).rgb; let c_exp=raw*uGrad.exposure; let lum=dot(c_exp, vec3f(0.2126,0.7152,0.0722)); var c_sat=mix(vec3f(lum), c_exp, uGrad.saturation); c_sat=max(c_sat, vec3f(0.0));
-  let peak=max(c_sat.r, max(c_sat.g, c_sat.b)); let H=max(uGrad.headroom,0.5); let mappedPeak=(peak*H)*inverseSqrt(H*H+peak*peak); let scale=select(1.0, mappedPeak/max(peak,1e-6), peak>0.0); let c_hdr=c_sat*scale; return vec4f(c_hdr,1.0);
+  let peak=max(c_sat.r, max(c_sat.g, c_sat.b)); let H=max(uGrad.headroom,0.5); let mappedPeak=(peak*H)*inverseSqrt(H*H+peak*peak); let scale=select(1.0, mappedPeak/max(peak,1e-6), peak>0.0); let c_hdr=c_sat*scale; return vec4f(linearToSrgb(c_hdr),1.0);
 }
 `;
 

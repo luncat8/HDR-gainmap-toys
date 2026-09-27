@@ -185,8 +185,13 @@ const shader = device.createShaderModule({
 
 			let hdr = exposed * gain;
 
-			// Значения hdr выше 1.0 сохраняются в rgba16float.
-			return vec4f(hdr, 1.0);
+			// canvas holds extended-sRGB: encode the OETF here, the display applies the EOTF.
+			// (linear values above 1.0 survive in rgba16float as extended-range sRGB.)
+			let x = max(hdr, vec3f(0.0));
+			let lo = x * 12.92;
+			let hi = 1.055 * pow(x, vec3f(1.0 / 2.4)) - 0.055;
+			let encoded = select(hi, lo, x <= vec3f(0.0031308));
+			return vec4f(encoded, 1.0);
 		}
 	`,
 });

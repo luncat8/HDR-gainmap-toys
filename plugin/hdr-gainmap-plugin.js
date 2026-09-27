@@ -378,11 +378,12 @@
 			var presentPipe = pipe('fs_present', 'rgba16float');
 			var histPipe = pipe('fs_hist', 'rgba16float');
 			var hdrToGainPipe = pipe('fs_hdr_to_gain', 'rgba8unorm');
+			var tonemapPipe = pipe('fs_tonemap', 'rgba8unorm');
 			var samp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
 			var uboSize = (12 + LUT_SAMPLES) * 4;
 			var ubo = device.createBuffer({ size: uboSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 			var params = new Float32Array(12 + LUT_SAMPLES);
-			processor = { device: device, module: module, layout: layout, gainPipe: gainPipe, applyPipe: applyPipe, presentPipe: presentPipe, histPipe: histPipe, hdrToGainPipe: hdrToGainPipe, sampler: samp, ubo: ubo, params: params, lut: new Float32Array(LUT_SAMPLES) };
+			processor = { device: device, module: module, layout: layout, gainPipe: gainPipe, applyPipe: applyPipe, presentPipe: presentPipe, histPipe: histPipe, hdrToGainPipe: hdrToGainPipe, tonemapPipe: tonemapPipe, sampler: samp, ubo: ubo, params: params, lut: new Float32Array(LUT_SAMPLES) };
 			return processor;
 		})();
 	}
@@ -429,9 +430,17 @@ fn weight() -> f32 {
 @fragment fn fs_hist(in : VSOut) -> @location(0) vec4f {
   let a = srgbToLinear(textureSampleLevel(tex0,samp,in.uv,0.0).rgb); let b = textureSampleLevel(tex1,samp,in.uv,0.0).rgb; return vec4f(log2(max(luma(a),1e-6)), log2(max(luma(b),1e-6)), 0.0, 1.0);
 }
+@fragment fn fs_tonemap(in : VSOut) -> @location(0) vec4f {
+  let hdr = textureSampleLevel(tex0, samp, in.uv, 0.0).rgb * exp2(P.b.x);
+  let peak = max(hdr.r, max(hdr.g, hdr.b));
+  let H = exp2(P.b.y);
+  let mapped = (peak*H) * inverseSqrt(H*H + peak*peak);
+  let scale = select(1.0, mapped / max(peak,1e-6), peak>0.0);
+  return vec4f(linearToSrgb(clamp(hdr*scale, vec3f(0.0), vec3f(1.0))), 1.0);
+}
 @fragment fn fs_hdr_to_gain(in : VSOut) -> @location(0) vec4f {
-  let hdr = textureSampleLevel(tex0,samp,in.uv,0.0).rgb;
-  let sdr = textureSampleLevel(tex1,samp,in.uv,0.0).rgb;
+  let hdr = textureSampleLevel(tex0,samp,in.uv,0.0).rgb * exp2(P.b.x);
+  let sdr = srgbToLinear(textureSampleLevel(tex1, samp, in.uv, 0.0).rgb);
   let lh = max(luma(hdr), 1e-6); let ls = max(luma(sdr), 1e-6);
   let logBoost = log2(lh/ls);
   let norm = clamp((logBoost - P.a.x)/(P.a.y - P.a.x), 0.0, 1.0);
@@ -490,11 +499,12 @@ fn weight() -> f32 {
 		lutMin: 0, lutMax: 1,
 		view: 'hdr'
 	};
-	var gpuProc = null, srcTex = null, gainTex = null, hdrTex = null, fileBaseTex = null, fileGainTex = null;
+	var gpuProc = null, srcTex = null, sdrTex = null, gainTex = null, hdrTex = null;
 	var gainW = 0, gainH = 0, ubo = null, samp = null, gainPipe = null, applyPipe = null, presentPipe = null, histPipe = null, hdrToGainPipe = null;
-	var bgGain = null, bgApply = null, bgPresent = null, bgGainView = null, bgHist = null, bgBase = null, bgLayout = null;
-	var histTex = null, canvasEl = null, histEl = null, curveCanvas = null, statusEl = null;
+	var bgTonemap = null, bgGain = null, bgApply = null, bgPresent = null, bgGainView = null, bgHist = null, bgBase = null, bgLayout = null;
+	var histTex = null, canvasEl = null, histEl = null, curveCanvas = null, statusEl = null, viewEl = null;
 	var curveEditor = null;
+	var renderQueued = false;
 
 	var perCanvasRoot = null;
 	var perCanvasButtons = [];
@@ -547,7 +557,12 @@ fn weight() -> f32 {
 <div id="hdr-editor" class="hidden">
 <h3>Editor</h3>
 <div id="hdr-preview-wrap" style="background:#000;border-radius:8px;overflow:hidden"><canvas id="hdr-preview" style="width:100%;display:block"></canvas></div>
-<canvas id="hdr-histo" height="90"></canvas>
+<div id="hdr-viewrow" style="display:flex;gap:6px;margin:6px 0">
+<button data-view="hdr" style="flex:1">HDR</button>
+<button data-view="sdr" style="flex:1">SDR base</button>
+<button data-view="gain" style="flex:1">gain map</button>
+</div>
+<canvas id="hdr-histo" height="90" style="display:none"></canvas>
 <canvas id="hdr-curve" width="300" height="160"></canvas>
 <div id="hdr-controls"></div>
 <div style="display:flex;gap:6px;margin-top:8px">
@@ -573,6 +588,13 @@ fn weight() -> f32 {
 		panel.querySelector('#hdr-close-editor').addEventListener('click', function () { editorEl.classList.add('hidden'); });
 		panel.querySelector('#hdr-save').addEventListener('click', save);
 		panel.querySelector('#hdr-export').addEventListener('click', exportPair);
+		viewEl = panel.querySelector('#hdr-viewrow');
+		var vb = viewEl.querySelectorAll('button');
+		for (var vi = 0; vi < vb.length; vi++) {
+			(function (b) {
+				b.addEventListener('click', function () { state.view = b.getAttribute('data-view'); updateModeUI(); requestRender(); });
+			})(vb[vi]);
+		}
 	}
 
 	function updatePerCanvasButtons() {
@@ -709,6 +731,7 @@ fn weight() -> f32 {
 			await initProcessorForSource(bitmap);
 			editorEl.classList.remove('hidden');
 			panel.classList.remove('hidden');
+			updateModeUI();
 			render();
 			setStatus('SDR captured ' + state.srcW + '×' + state.srcH);
 		} catch (e) { setStatus('SDR capture failed: ' + e.message); console.error(e); }
@@ -733,11 +756,15 @@ fn weight() -> f32 {
 				await initProcessorForSource(bitmap);
 				editorEl.classList.remove('hidden');
 				panel.classList.remove('hidden');
+				updateModeUI();
 				render();
 				setStatus('Canvas not WebGPU HDR, treated as SDR');
 				return;
 			}
-			// data: { data: Float32Array rgba, width, height }
+			// swapchain holds extended-sRGB (OETF-encoded); the display applies the EOTF.
+		// Decode to linear once — everything downstream is linear light.
+		data.data = srgbToLinearData(data.data);
+		// data: { data: Float32Array linear rgba, width, height }
 			state.sourceCanvas = canvas;
 			state.sourceType = 'hdr';
 			state.srcW = data.width;
@@ -748,6 +775,7 @@ fn weight() -> f32 {
 			await initProcessorForHDR(data);
 			editorEl.classList.remove('hidden');
 			panel.classList.remove('hidden');
+			updateModeUI();
 			renderHDR();
 			setStatus('HDR captured ' + data.width + '×' + data.height + ' — max ' + maxHDR(data.data).toFixed(2));
 		} catch (e) { setStatus('HDR capture failed: ' + e.message); console.error(e); }
@@ -757,6 +785,16 @@ fn weight() -> f32 {
 		var m = 0;
 		for (var i = 0; i < arr.length; i += 4) { var v = Math.max(arr[i], arr[i + 1], arr[i + 2]); if (v > m) m = v; }
 		return m;
+	}
+
+	function srgbToLinearData(src) {
+		var out = new Float32Array(src.length);
+		for (var i = 0; i < src.length; i++) {
+			var v = src[i];
+			if (!(v > 0)) { out[i] = 0; continue; }
+			out[i] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+		}
+		return out;
 	}
 
 	// ── processor init ─────────────────────────────────────────────────────
@@ -776,6 +814,7 @@ fn weight() -> f32 {
 		if (gainTex) { try { gainTex.destroy(); } catch (e) {} gainTex = null; }
 		if (hdrTex) { try { hdrTex.destroy(); } catch (e) {} hdrTex = null; }
 		if (histTex) { try { histTex.destroy(); } catch (e) {} histTex = null; }
+		if (sdrTex) { try { sdrTex.destroy(); } catch (e) {} sdrTex = null; }
 		var gs = gainSize();
 		gainW = gs[0]; gainH = gs[1];
 		srcTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -815,14 +854,17 @@ fn weight() -> f32 {
 		var proc = gpuProc;
 		var device = proc.device;
 		if (srcTex) { try { srcTex.destroy(); } catch (e) {} srcTex = null; }
+		if (sdrTex) { try { sdrTex.destroy(); } catch (e) {} sdrTex = null; }
 		if (gainTex) { try { gainTex.destroy(); } catch (e) {} gainTex = null; }
 		if (hdrTex) { try { hdrTex.destroy(); } catch (e) {} hdrTex = null; }
 		if (histTex) { try { histTex.destroy(); } catch (e) {} histTex = null; }
-		gainW = state.srcW; gainH = state.srcH;
-		srcTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
-		gainTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
-		hdrTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
-		// upload HDR data as rgba16float via writeTexture with float32? need to convert to half? Simpler: upload as rgba8? Actually we have float32 data, we can write via buffer with rgba16float texture using writeTexture expects bytes. We'll convert to half first.
+		var gs = gainSize();
+		gainW = gs[0]; gainH = gs[1];
+		srcTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+		sdrTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+		gainTex = device.createTexture({ size: [gainW, gainH], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+		hdrTex = device.createTexture({ size: [state.srcW, state.srcH], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+		// srcTex holds linear HDR; upload via half-float bytes with 256-padded rows
 		var half = floatToHalfArray(hdrData.data);
 		var padded = Math.ceil(state.srcW * 8 / 256) * 256;
 		var bytes;
@@ -836,12 +878,13 @@ fn weight() -> f32 {
 		device.queue.writeTexture({ texture: srcTex }, bytes, { bytesPerRow: padded, rowsPerImage: state.srcH }, { width: state.srcW, height: state.srcH });
 		var layout = proc.layout;
 		function bg(t0, t1) { return device.createBindGroup({ layout: layout, entries: [{ binding: 0, resource: { buffer: proc.ubo } }, { binding: 1, resource: proc.sampler }, { binding: 2, resource: t0.createView() }, { binding: 3, resource: t1.createView() }] }); }
-		bgGain = bg(srcTex, srcTex);
-		bgApply = bg(srcTex, gainTex);
+		bgTonemap = bg(srcTex, srcTex);
+		bgGain = bg(srcTex, sdrTex);
+		bgApply = bg(sdrTex, gainTex);
 		bgPresent = bg(hdrTex, hdrTex);
 		bgGainView = bg(gainTex, gainTex);
-		bgBase = bg(srcTex, srcTex);
-		bgHist = bg(srcTex, hdrTex);
+		bgBase = bg(sdrTex, sdrTex);
+		bgHist = bg(sdrTex, hdrTex);
 		sizePreview();
 		var ctx = canvasEl.getContext('webgpu');
 		if (!ctx._hdrConfigured) {
@@ -928,35 +971,113 @@ fn weight() -> f32 {
 		passGain.setPipeline(proc.gainPipe); passGain.setBindGroup(0, bgGain); passGain.draw(3); passGain.end();
 		var passApply = enc.beginRenderPass({ colorAttachments: [{ view: hdrTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
 		passApply.setPipeline(proc.applyPipe); passApply.setBindGroup(0, bgApply); passApply.draw(3); passApply.end();
-		var presentGroup = state.view === 'gain' ? bgGainView : state.view === 'sdr' ? bgBase : bgPresent;
+		var pg = presentGroup();
 		var ctx = canvasEl.getContext('webgpu');
 		var passPresent = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
-		passPresent.setPipeline(proc.presentPipe); passPresent.setBindGroup(0, presentGroup); passPresent.draw(3); passPresent.end();
+		passPresent.setPipeline(proc.presentPipe); passPresent.setBindGroup(0, pg); passPresent.draw(3); passPresent.end();
 		device.queue.submit([enc.finish()]);
+	}
+
+	function hdrTonemapScale(peak, H) {
+		if (!(peak > 1e-6)) return 1;
+		return H / Math.sqrt(H * H + peak * peak);
+	}
+
+	function hdrRange() {
+		var hdr = state.hdrData.data;
+		var E = Math.pow(2, state.params.exposure), H = Math.max(state.params.headroom, 0.5);
+		var minLog = Infinity, maxLog = -Infinity;
+		for (var i = 0; i < hdr.length; i += 4) {
+			var r = hdr[i] * E, g = hdr[i + 1] * E, b = hdr[i + 2] * E;
+			var s = hdrTonemapScale(Math.max(r, g, b), H);
+			var lh = Math.max(1e-6, luma(r, g, b));
+			var ls = Math.max(1e-6, luma(Math.min(1, r * s), Math.min(1, g * s), Math.min(1, b * s)));
+			var lb = Math.log2(lh / ls);
+			if (lb < minLog) minLog = lb;
+			if (lb > maxLog) maxLog = lb;
+		}
+		if (!isFinite(minLog)) { minLog = 0; maxLog = 1; }
+		if (maxLog - minLog < 0.01) maxLog = minLog + 0.01;
+		return { minLog: minLog, maxLog: maxLog };
+	}
+
+	function presentGroup() {
+		if (state.view === 'gain') return bgGainView;
+		if (state.view === 'sdr') return bgBase;
+		return bgPresent;
 	}
 
 	function renderHDR() {
-		if (!gpuProc || !srcTex) return;
-		// For HDR source, we need to generate SDR base + gain map from HDR
-		// Simplified: tonemap HDR to SDR via present shader, then compute gain via CPU? For preview we just show HDR with exposure.
+		if (!gpuProc || !srcTex || !sdrTex) return;
 		var proc = gpuProc;
 		var device = proc.device;
-		writeParams({ rangeMin: 0, rangeMax: 1, capacityMin: 0, capacityMax: 1, exposure: state.params.exposure, headroom: state.params.headroom, mode: MODES[state.view] || 0, gainScale: state.params.gainScale });
+		var range = hdrRange();
+		var capMin = Math.max(range.minLog, 0), capMax = range.maxLog;
+		// exposure lives in the tonemap/gain passes; present must not apply it twice,
+		// so the two stages run as separate submits with different uniforms
+		writeParams({ rangeMin: range.minLog, rangeMax: range.maxLog, capacityMin: capMin, capacityMax: capMax, exposure: state.params.exposure, headroom: state.params.headroom, mode: MODES[state.view] || 0, gainScale: state.params.gainScale });
 		var enc = device.createCommandEncoder();
-		// For HDR preview, just present srcTex directly with exposure
-		var ctx = canvasEl.getContext('webgpu');
-		var pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
-		pass.setPipeline(proc.presentPipe); pass.setBindGroup(0, bgBase); pass.draw(3); pass.end();
+		var pTone = enc.beginRenderPass({ colorAttachments: [{ view: sdrTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+		pTone.setPipeline(proc.tonemapPipe); pTone.setBindGroup(0, bgTonemap); pTone.draw(3); pTone.end();
+		var pGain = enc.beginRenderPass({ colorAttachments: [{ view: gainTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+		pGain.setPipeline(proc.hdrToGainPipe); pGain.setBindGroup(0, bgGain); pGain.draw(3); pGain.end();
+		var pApply = enc.beginRenderPass({ colorAttachments: [{ view: hdrTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+		pApply.setPipeline(proc.applyPipe); pApply.setBindGroup(0, bgApply); pApply.draw(3); pApply.end();
 		device.queue.submit([enc.finish()]);
+		writeParams({ rangeMin: range.minLog, rangeMax: range.maxLog, capacityMin: capMin, capacityMax: capMax, exposure: 0, headroom: state.params.headroom, mode: MODES[state.view] || 0, gainScale: state.params.gainScale });
+		var enc2 = device.createCommandEncoder();
+		var ctx = canvasEl.getContext('webgpu');
+		var pPresent = enc2.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+		pPresent.setPipeline(proc.presentPipe); pPresent.setBindGroup(0, presentGroup()); pPresent.draw(3); pPresent.end();
+		device.queue.submit([enc2.finish()]);
 	}
 
 	// ── controls ───────────────────────────────────────────────────────────
+	var controls = {};
+	var rebuildTimer = 0;
+
+	function requestRender() {
+		if (renderQueued) return;
+		renderQueued = true;
+		var run = function () {
+			renderQueued = false;
+			if (state.sourceType === 'hdr' && state.hdrData) renderHDR();
+			else render();
+		};
+		if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+		else run();
+	}
+
+	function queueRebuild() {
+		if (rebuildTimer) clearTimeout(rebuildTimer);
+		rebuildTimer = setTimeout(function () {
+			rebuildTimer = 0;
+			if (state.sourceType === 'hdr' && state.hdrData) initProcessorForHDR(state.hdrData).then(requestRender);
+			else if (state.sourceCanvas) initProcessorForSource(state.sourceCanvas).then(requestRender);
+		}, 150);
+	}
+
+	function updateModeUI() {
+		var hdr = state.sourceType === 'hdr';
+		for (var k in controls) {
+			if (controls[k].sdrOnly) controls[k].row.style.display = hdr ? 'none' : '';
+		}
+		if (curveCanvas) curveCanvas.style.display = hdr ? 'none' : '';
+		if (viewEl) {
+			var btns = viewEl.querySelectorAll('button');
+			for (var i = 0; i < btns.length; i++) {
+				btns[i].style.borderColor = btns[i].getAttribute('data-view') === state.view ? '#7fd4ff' : '';
+			}
+		}
+	}
+
 	function buildControls() {
 		var container = document.getElementById('hdr-controls');
 		if (!container) return;
 		container.innerHTML = '';
+		controls = {};
 		var p = state.params;
-		function slider(label, min, max, step, value, fmt, onInput) {
+		function slider(label, min, max, step, value, fmt, onInput, sdrOnly) {
 			var row = document.createElement('label'); row.className = 'row';
 			var l = document.createElement('span'); l.className = 'label'; l.textContent = label;
 			var input = document.createElement('input'); input.type = 'range'; input.min = min; input.max = max; input.step = step; input.value = value;
@@ -964,16 +1085,19 @@ fn weight() -> f32 {
 			input.addEventListener('input', function () { var v = parseFloat(input.value); out.textContent = fmt ? fmt(v) : v; onInput(v); });
 			row.appendChild(l); row.appendChild(input); row.appendChild(out);
 			container.appendChild(row);
-			return { set: function (v) { input.value = v; out.textContent = fmt ? fmt(v) : v; } };
+			var c = { set: function (v) { input.value = v; out.textContent = fmt ? fmt(v) : v; }, row: row, sdrOnly: !!sdrOnly };
+			controls[label] = c;
+			return c;
 		}
-		slider('shadow lift', -2, 1, 0.05, p.shadowLift, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.shadowLift = v; if (state.sourceType === 'sdr') render(); });
-		slider('highlight gain', 0, 4, 0.05, p.highlightGain, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.highlightGain = v; if (state.sourceType === 'sdr') render(); });
-		slider('threshold', 0.05, 1, 0.01, p.threshold, function (v) { return v.toFixed(2); }, function (v) { p.threshold = v; state.curvePoints = rampPoints(v); refreshLUT(); if (curveEditor) curveEditor.draw(); if (state.sourceType === 'sdr') render(); });
-		slider('peak nits', 100, 4000, 10, p.peakNits, function (v) { return v.toFixed(0); }, function (v) { p.peakNits = v; if (state.sourceType === 'sdr') render(); });
-		slider('SDR white', 80, 400, 1, p.sdrWhite, function (v) { return v.toFixed(0); }, function (v) { p.sdrWhite = v; if (state.sourceType === 'sdr') render(); });
-		slider('gain scale', 1, 8, 1, p.gainScale, function (v) { return '1:' + v; }, function (v) { p.gainScale = v; if (state.sourceType === 'sdr') { gainSize(); initProcessorForSource(state.sourceCanvas).then(render); } });
-		slider('exposure', -3, 3, 0.05, p.exposure, function (v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }, function (v) { p.exposure = v; if (state.sourceType === 'sdr') render(); else renderHDR(); });
-		slider('headroom', 1, 16, 0.25, p.headroom, function (v) { return v.toFixed(2) + '×'; }, function (v) { p.headroom = v; if (state.sourceType === 'sdr') render(); else renderHDR(); });
+		slider('shadow lift', -2, 1, 0.05, p.shadowLift, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.shadowLift = v; requestRender(); }, true);
+		slider('highlight gain', 0, 4, 0.05, p.highlightGain, function (v) { return v.toFixed(2) + ' stops'; }, function (v) { p.highlightGain = v; requestRender(); }, true);
+		slider('threshold', 0.05, 1, 0.01, p.threshold, function (v) { return v.toFixed(2); }, function (v) { p.threshold = v; state.curvePoints = rampPoints(v); refreshLUT(); if (curveEditor) curveEditor.draw(); requestRender(); }, true);
+		slider('peak nits', 100, 4000, 10, p.peakNits, function (v) { return v.toFixed(0); }, function (v) { p.peakNits = v; requestRender(); }, true);
+		slider('SDR white', 80, 400, 1, p.sdrWhite, function (v) { return v.toFixed(0); }, function (v) { p.sdrWhite = v; requestRender(); }, true);
+		slider('gain scale', 1, 8, 1, p.gainScale, function (v) { return '1:' + v; }, function (v) { p.gainScale = v; queueRebuild(); });
+		slider('exposure', -3, 3, 0.05, p.exposure, function (v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }, function (v) { p.exposure = v; requestRender(); });
+		slider('headroom', 1, 16, 0.25, p.headroom, function (v) { return v.toFixed(2) + '×'; }, function (v) { p.headroom = v; requestRender(); });
+		updateModeUI();
 	}
 
 	function refreshLUT() {
@@ -1005,10 +1129,10 @@ fn weight() -> f32 {
 			var p = local(e); drag = hit(p[0], p[1]);
 			if (drag < 0 && !e.shiftKey) { var np = fromPx(p[0], p[1]); state.curvePoints.push(np); state.curvePoints.sort(function (a, b) { return a[0] - b[0]; }); drag = state.curvePoints.indexOf(np); }
 			if (drag >= 0 && e.shiftKey && state.curvePoints.length > 2) { state.curvePoints.splice(drag, 1); drag = -1; }
-			draw(); refreshLUT(); render();
+			draw(); refreshLUT(); requestRender();
 		});
 		curveCanvas.addEventListener('pointermove', function (e) {
-			if (drag < 0) return; var p = local(e); var pt = fromPx(p[0], p[1]); var min = drag > 0 ? state.curvePoints[drag - 1][0] + 0.01 : 0; var max = drag < state.curvePoints.length - 1 ? state.curvePoints[drag + 1][0] - 0.01 : 1; pt[0] = Math.min(max, Math.max(min, pt[0])); state.curvePoints[drag] = pt; draw(); refreshLUT(); render();
+			if (drag < 0) return; var p = local(e); var pt = fromPx(p[0], p[1]); var min = drag > 0 ? state.curvePoints[drag - 1][0] + 0.01 : 0; var max = drag < state.curvePoints.length - 1 ? state.curvePoints[drag + 1][0] - 0.01 : 1; pt[0] = Math.min(max, Math.max(min, pt[0])); state.curvePoints[drag] = pt; draw(); refreshLUT(); requestRender();
 		});
 		window.addEventListener('pointerup', function () { drag = -1; draw(); });
 		draw();
@@ -1057,62 +1181,40 @@ fn weight() -> f32 {
 	async function encodeFromHDR() {
 		var p = state.params;
 		var hdr = state.hdrData.data, w = state.hdrData.width, h = state.hdrData.height;
-		// tonemap HDR to SDR for base
-		var sdr = new Float32Array(w * h * 4);
-		var minLog = Infinity, maxLog = -Infinity;
-		var exposure = Math.pow(2, p.exposure);
-		for (var i = 0; i < w * h; i++) {
-			var idx = i * 4;
-			var r = hdr[idx] * exposure, g = hdr[idx + 1] * exposure, b = hdr[idx + 2] * exposure;
-			// preserve chroma, compress peak to 1.0
-			var peak = Math.max(r, g, b);
-			var H = p.headroom;
-			var mappedPeak = (peak * H) / Math.sqrt(H * H + peak * peak);
-			var scale = peak > 1e-6 ? mappedPeak / peak : 1;
-			var rr = r * scale, gg = g * scale, bb = b * scale;
-			// clamp to 1 for SDR
-			rr = Math.min(1, rr); gg = Math.min(1, gg); bb = Math.min(1, bb);
-			sdr[idx] = rr; sdr[idx + 1] = gg; sdr[idx + 2] = bb; sdr[idx + 3] = 1;
-			var lh = Math.max(1e-6, luma(hdr[idx], hdr[idx + 1], hdr[idx + 2]) * exposure);
-			var ls = Math.max(1e-6, luma(rr, gg, bb));
-			var logBoost = Math.log2(lh / ls);
-			if (logBoost < minLog) minLog = logBoost;
-			if (logBoost > maxLog) maxLog = logBoost;
-		}
-		if (!isFinite(minLog)) { minLog = 0; maxLog = 1; }
-		if (maxLog - minLog < 0.01) { maxLog = minLog + 0.01; }
-		// create base canvas
+		var E = Math.pow(2, p.exposure), H = Math.max(p.headroom, 0.5);
+		var range = hdrRange();
+		var minLog = range.minLog, maxLog = range.maxLog;
 		var baseCanvas = document.createElement('canvas'); baseCanvas.width = w; baseCanvas.height = h;
 		var bctx = baseCanvas.getContext('2d'); var bimg = bctx.createImageData(w, h);
-		for (var j = 0; j < w * h; j++) {
-			var id = j * 4;
-			bimg.data[id] = Math.round(linearToSrgb(sdr[id]) * 255);
-			bimg.data[id + 1] = Math.round(linearToSrgb(sdr[id + 1]) * 255);
-			bimg.data[id + 2] = Math.round(linearToSrgb(sdr[id + 2]) * 255);
-			bimg.data[id + 3] = 255;
+		var gw = Math.max(1, Math.ceil(w / p.gainScale)), gh = Math.max(1, Math.ceil(h / p.gainScale));
+		var acc = new Float32Array(gw * gh), cnt = new Float32Array(gw * gh);
+		for (var i = 0; i < w * h; i++) {
+			var idx = i * 4;
+			var r = hdr[idx] * E, g = hdr[idx + 1] * E, b = hdr[idx + 2] * E;
+			var s = hdrTonemapScale(Math.max(r, g, b), H);
+			var br = Math.min(1, Math.max(0, r * s)), bgv = Math.min(1, Math.max(0, g * s)), bb = Math.min(1, Math.max(0, b * s));
+			bimg.data[idx] = Math.round(linearToSrgb(br) * 255);
+			bimg.data[idx + 1] = Math.round(linearToSrgb(bgv) * 255);
+			bimg.data[idx + 2] = Math.round(linearToSrgb(bb) * 255);
+			bimg.data[idx + 3] = 255;
+			var lh = Math.max(1e-6, luma(r, g, b));
+			var ls = Math.max(1e-6, luma(br, bgv, bb));
+			var gx = Math.min(gw - 1, (i % w) * gw / w | 0), gy = Math.min(gh - 1, (i / w | 0) * gh / h | 0);
+			var gi = gy * gw + gx;
+			acc[gi] += Math.log2(lh / ls); cnt[gi]++;
 		}
 		bctx.putImageData(bimg, 0, 0);
 		var baseBlob = await new Promise(function (res) { baseCanvas.toBlob(res, 'image/jpeg', p.baseQuality / 100); });
-		// gain map
-		var gw = Math.max(1, Math.ceil(w / p.gainScale)), gh = Math.max(1, Math.ceil(h / p.gainScale));
 		var gainCanvas = document.createElement('canvas'); gainCanvas.width = gw; gainCanvas.height = gh;
 		var gctx = gainCanvas.getContext('2d'); var gimg = gctx.createImageData(gw, gh);
-		for (var y = 0; y < gh; y++) {
-			for (var x = 0; x < gw; x++) {
-				var sx = Math.floor(x * w / gw), sy = Math.floor(y * h / gh);
-				var sidx = (sy * w + sx) * 4;
-				var lh2 = Math.max(1e-6, luma(hdr[sidx], hdr[sidx + 1], hdr[sidx + 2]) * exposure);
-				var ls2 = Math.max(1e-6, luma(sdr[sidx], sdr[sidx + 1], sdr[sidx + 2]));
-				var lb = Math.log2(lh2 / ls2);
-				var norm = Math.min(1, Math.max(0, (lb - minLog) / (maxLog - minLog)));
-				var v = Math.round(norm * 255);
-				var gidx = (y * gw + x) * 4;
-				gimg.data[gidx] = v; gimg.data[gidx + 1] = v; gimg.data[gidx + 2] = v; gimg.data[gidx + 3] = 255;
-			}
+		for (var gi2 = 0; gi2 < gw * gh; gi2++) {
+			var norm = Math.min(1, Math.max(0, ((cnt[gi2] ? acc[gi2] / cnt[gi2] : minLog) - minLog) / (maxLog - minLog)));
+			var v = Math.round(norm * 255);
+			gimg.data[gi2 * 4] = v; gimg.data[gi2 * 4 + 1] = v; gimg.data[gi2 * 4 + 2] = v; gimg.data[gi2 * 4 + 3] = 255;
 		}
 		gctx.putImageData(gimg, 0, 0);
 		var gainBlob = await new Promise(function (res) { gainCanvas.toBlob(res, 'image/jpeg', p.gainQuality / 100); });
-		return { base: await bytesOf(baseBlob), gain: await bytesOf(gainBlob), meta: { gainMapMin: minLog, gainMapMax: maxLog, hdrCapacityMin: Math.max(minLog, 0), hdrCapacityMax: capacityMax(), offsetSDR: 0, offsetHDR: 0, gamma: 1 } };
+		return { base: await bytesOf(baseBlob), gain: await bytesOf(gainBlob), meta: { gainMapMin: minLog, gainMapMax: maxLog, hdrCapacityMin: Math.max(minLog, 0), hdrCapacityMax: maxLog, offsetSDR: 0, offsetHDR: 0, gamma: 1 } };
 	}
 
 	async function save() {
